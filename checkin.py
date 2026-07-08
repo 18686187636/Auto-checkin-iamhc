@@ -169,6 +169,7 @@ def main():
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
+            f"https://api.iamhc.cn"
         )
     elif "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
         # 今日已签到
@@ -181,6 +182,7 @@ def main():
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
+            f"https://api.iamhc.cn"
         )
     else:
         # 签到失败
@@ -193,6 +195,7 @@ def main():
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
+            f"https://api.iamhc.cn"
         )
 
     # 发送通知
