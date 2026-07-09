@@ -10,7 +10,7 @@ PASSWORD      = os.environ.get("PASSWORD") or ""
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 
-BASE_URL      = "https://api.iamhc.cn"
+BASE_URL      = ""
 QUOTA_PER_UNIT = 500000 # new-api 默认额度换算比例：500000 quota = 1$
 TURNSTILE_TOKEN = ""    # 该站点暂未开启 turuntile,暂时用不上此参数
 
@@ -169,7 +169,7 @@ def main():
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}\n"
-            f"https://api.iamhc.cn"
+            f"https://api.hcnsec.cn"
         )
     elif "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
         # 今日已签到
@@ -182,7 +182,7 @@ def main():
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}\n"
-            f"https://api.iamhc.cn"
+            f"https://api.hcnsec.cn"
         )
     else:
         # 签到失败
@@ -195,7 +195,7 @@ def main():
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}\n"
-            f"https://api.iamhc.cn"
+            f"https://api.hcnsec.cn"
         )
 
     # 发送通知
