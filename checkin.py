@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,sys,time,requests
-from datetime import datetime
+import os, sys, time, requests
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 EMAIL         = os.environ.get("EMAIL") or ""
 PASSWORD      = os.environ.get("PASSWORD") or ""
@@ -11,9 +13,52 @@ TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 
 BASE_URL = "https://api.hcnsec.cn"
-QUOTA_PER_UNIT = 500000 # new-api 默认额度换算比例：500000 quota = 1$
-TURNSTILE_TOKEN = ""    # 该站点暂未开启 turuntile,暂时用不上此参数
+QUOTA_PER_UNIT = 500000          # new-api 默认额度换算比例：500000 quota = 1$
+TURNSTILE_TOKEN = ""             # 该站点暂未开启 turnstile，暂不用此参数
 
+TZ_CN = timezone(timedelta(hours=8))
+
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+def make_session() -> requests.Session:
+    """带重试的 requests.Session"""
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    return s
+
+
+def safe_json(resp):
+    """安全解析 JSON，失败返回 None 并打印响应片段"""
+    try:
+        return resp.json()
+    except ValueError:
+        print(f"响应非 JSON | HTTP {resp.status_code} | {resp.text[:200]}")
+        return None
+
+
+def quota_to_dollar(quota):
+    """quota -> 美元（float，保留精度，不做四舍五入）"""
+    return quota / QUOTA_PER_UNIT
+
+
+def fmt_usd(v):
+    """格式化美元金额，去掉多余的 0"""
+    s = f"{v:.4f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+# ---------------------------------------------------------------------------
+# 业务逻辑
+# ---------------------------------------------------------------------------
 def login(session: requests.Session):
     """登录并返回用户信息（id + username）。"""
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
@@ -34,19 +79,29 @@ def login(session: requests.Session):
     )
 
     if resp.status_code != 200:
-        print("登录请求失败:", resp.status_code)
+        print("登录请求失败:", resp.status_code, resp.text[:200])
         return None
 
-    data = resp.json()
+    data = safe_json(resp)
+    if not data:
+        return None
+
     if not data.get("success"):
         print("登录失败:", data.get("message", ""))
         return None
 
-    user_data = data.get("data", {})
-    user_id = user_data.get("id")
-    username = user_data.get("username", "")
+    # ✅ 关键修复：user 数据在 data.user 里，不是 data 本身
+    user_data = (data.get("data") or {}).get("user") or {}
+
+    user_id  = user_data.get("id")
+    username = user_data.get("username", "") or ""
+
+    # 兼容其它可能的字段名
     if not user_id:
-        print("登录成功但未获取到用户 ID")
+        user_id = user_data.get("Id") or user_data.get("user_id") or user_data.get("uid")
+
+    if not user_id:
+        print("登录成功但未获取到用户 ID，user_data keys =", list(user_data.keys()))
         return None
 
     print(f"✅ 登录成功 | 账户: {username} | ID: {user_id}")
@@ -61,14 +116,24 @@ def get_user_info(session: requests.Session, user_id):
         "Accept": "application/json, text/plain, */*",
         "User-Agent": "Mozilla/5.0",
         "Referer": BASE_URL,
-        "New-Api-User": str(user_id),
     }
+    if user_id:
+        headers["New-Api-User"] = str(user_id)
 
     resp = session.get(url, headers=headers, timeout=20)
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {})
-    return None
+    data = safe_json(resp)
+    if not data:
+        return None
+
+    if not data.get("success"):
+        print("获取用户信息失败:", data.get("message", ""))
+        return None
+
+    ud = data.get("data") or {}
+    # 兼容 {data: {user: {...}}} 的嵌套结构
+    if isinstance(ud, dict) and "user" in ud and isinstance(ud["user"], dict):
+        ud = ud["user"]
+    return ud
 
 
 def checkin(session: requests.Session, user_id):
@@ -85,12 +150,8 @@ def checkin(session: requests.Session, user_id):
     }
 
     resp = session.post(url, headers=headers, json={}, timeout=20)
-    return resp.json()
-
-
-def quota_to_dollar(quota):
-    """将内部 quota 值转换为美元金额（整数）。"""
-    return round(quota / QUOTA_PER_UNIT)
+    data = safe_json(resp)
+    return data or {"success": False, "message": f"签到接口异常 HTTP {resp.status_code}"}
 
 
 def send_notification(message):
@@ -116,12 +177,15 @@ def send_notification(message):
         print("未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过 Telegram 推送")
 
 
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
 def main():
     if not EMAIL or not PASSWORD:
-        print("请先设置 EMAIL 和 PASSWORD 环境变量（或在脚本中填写默认值）")
+        print("请先设置 EMAIL 和 PASSWORD 环境变量")
         sys.exit(1)
 
-    session = requests.Session()
+    session = make_session()
 
     # 登录
     user = login(session)
@@ -129,7 +193,7 @@ def main():
         print("\n登录失败，无法继续签到")
         sys.exit(1)
 
-    user_id = user["id"]
+    user_id  = user["id"]
     username = user.get("username", str(user_id))
 
     # 获取签到前余额
@@ -150,40 +214,45 @@ def main():
     balance_after = quota_to_dollar(info_after.get("quota", 0))
 
     # 判断签到结果
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+    now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
     success = checkin_data.get("success", False)
-    msg = str(checkin_data.get("message", ""))
+    msg = str(checkin_data.get("message", "") or "")
 
     if success:
         # 签到成功
-        awarded_data = checkin_data.get("data", {})
-        awarded_quota = awarded_data.get("quota_awarded", 0)
-        awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
-        print(f"✅ 签到成功 | 获得: {awarded_dollar}$")
+        awarded_data = checkin_data.get("data") or {}
+        awarded_quota = awarded_data.get("quota_awarded", 0) or 0
+        if awarded_quota:
+            awarded_dollar = quota_to_dollar(awarded_quota)
+        else:
+            awarded_dollar = balance_after - balance_before
+
+        print(f"✅ 签到成功 | 获得: {fmt_usd(awarded_dollar)}$")
 
         message = (
             f"🎁 iamhc 签到通知\n\n"
-            f"✅ 签到成功,本次签到获得{awarded_dollar}$\n"
+            f"✅ 签到成功,本次签到获得 {fmt_usd(awarded_dollar)}$\n"
             f"👤 登录账户: {username}\n"
-            f"💰 昨日余额: {balance_before}$\n"
-            f"💰 当前余额: {balance_after}$\n"
+            f"💰 昨日余额: {fmt_usd(balance_before)}$\n"
+            f"💰 当前余额: {fmt_usd(balance_after)}$\n"
             f"⏱️ 签到时间: {now}\n"
-            f"https://api.hcnsec.cn"
+            f"{BASE_URL}"
         )
-    elif "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
+
+    elif any(k in msg for k in ("已签到", "重复签到", "今天已签到")):
         # 今日已签到
-        print(f"✅ 今日已签到 | 当前余额: {balance_after}$")
+        print(f"✅ 今日已签到 | 当前余额: {fmt_usd(balance_after)}$")
 
         message = (
             f"🎁 iamhc 签到通知\n\n"
             f"✅ 今日你已经签到过了！\n"
             f"👤 登录账户: {username}\n"
-            f"💰 昨日余额: {balance_before}$\n"
-            f"💰 当前余额: {balance_after}$\n"
+            f"💰 昨日余额: {fmt_usd(balance_before)}$\n"
+            f"💰 当前余额: {fmt_usd(balance_after)}$\n"
             f"⏱️ 签到时间: {now}\n"
-            f"https://api.hcnsec.cn"
+            f"{BASE_URL}"
         )
+
     else:
         # 签到失败
         print(f"❌ 签到失败 | {msg}")
@@ -192,10 +261,10 @@ def main():
             f"🎁 iamhc 签到通知\n\n"
             f"❌ 签到失败: {msg}\n"
             f"👤 登录账户: {username}\n"
-            f"💰 昨日余额: {balance_before}$\n"
-            f"💰 当前余额: {balance_after}$\n"
+            f"💰 昨日余额: {fmt_usd(balance_before)}$\n"
+            f"💰 当前余额: {fmt_usd(balance_after)}$\n"
             f"⏱️ 签到时间: {now}\n"
-            f"https://api.hcnsec.cn"
+            f"{BASE_URL}"
         )
 
     # 发送通知
