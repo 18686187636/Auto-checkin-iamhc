@@ -13,8 +13,8 @@ TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 
 BASE_URL = "https://api.hcnsec.cn"
-QUOTA_PER_UNIT = 500000          # new-api 默认额度换算比例：500000 quota = 1$
-TURNSTILE_TOKEN = ""             # 该站点暂未开启 turnstile，暂不用此参数
+QUOTA_PER_UNIT = 500000          # 500000 quota = 1$
+TURNSTILE_TOKEN = ""
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -23,7 +23,6 @@ TZ_CN = timezone(timedelta(hours=8))
 # 工具函数
 # ---------------------------------------------------------------------------
 def make_session() -> requests.Session:
-    """带重试的 requests.Session"""
     s = requests.Session()
     retry = Retry(
         total=3,
@@ -37,7 +36,6 @@ def make_session() -> requests.Session:
 
 
 def safe_json(resp):
-    """安全解析 JSON，失败返回 None 并打印响应片段"""
     try:
         return resp.json()
     except ValueError:
@@ -46,21 +44,35 @@ def safe_json(resp):
 
 
 def quota_to_dollar(quota):
-    """quota -> 美元（float，保留精度，不做四舍五入）"""
     return quota / QUOTA_PER_UNIT
 
 
 def fmt_usd(v):
-    """格式化美元金额，去掉多余的 0"""
     s = f"{v:.4f}".rstrip("0").rstrip(".")
     return s if s else "0"
+
+
+def auth_headers(access_token, user_id=None, json_body=False):
+    """统一生成带 Bearer Token 的请求头"""
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0",
+        "Origin": BASE_URL,
+        "Referer": BASE_URL,
+        "Authorization": f"Bearer {access_token}",
+    }
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    if user_id:
+        headers["New-Api-User"] = str(user_id)
+    return headers
 
 
 # ---------------------------------------------------------------------------
 # 业务逻辑
 # ---------------------------------------------------------------------------
 def login(session: requests.Session):
-    """登录并返回用户信息（id + username）。"""
+    """登录并返回 id / username / access_token"""
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
 
     headers = {
@@ -85,69 +97,55 @@ def login(session: requests.Session):
     data = safe_json(resp)
     if not data:
         return None
-
     if not data.get("success"):
         print("登录失败:", data.get("message", ""))
         return None
 
-    # ✅ 关键修复：user 数据在 data.user 里，不是 data 本身
-    user_data = (data.get("data") or {}).get("user") or {}
+    payload       = data.get("data") or {}
+    access_token  = payload.get("access_token") or ""
+    user_data     = payload.get("user") or {}
 
-    user_id  = user_data.get("id")
+    user_id  = user_data.get("id") or user_data.get("user_id") or user_data.get("uid")
     username = user_data.get("username", "") or ""
-
-    # 兼容其它可能的字段名
-    if not user_id:
-        user_id = user_data.get("Id") or user_data.get("user_id") or user_data.get("uid")
 
     if not user_id:
         print("登录成功但未获取到用户 ID，user_data keys =", list(user_data.keys()))
         return None
+    if not access_token:
+        print("登录成功但未获取到 access_token")
+        return None
+
+    # 用 bearer token 更新 session 的默认头，后续请求自动带上
+    session.headers.update({
+        "Authorization": f"Bearer {access_token}",
+        "New-Api-User":  str(user_id),
+    })
 
     print(f"✅ 登录成功 | 账户: {username} | ID: {user_id}")
-    return {"id": user_id, "username": username}
+    return {"id": user_id, "username": username, "access_token": access_token}
 
 
-def get_user_info(session: requests.Session, user_id):
-    """获取用户信息，返回 data 字典（包含 quota 等字段）。"""
+def get_user_info(session: requests.Session, user_id, access_token):
     url = f"{BASE_URL}/api/user/self"
-
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0",
-        "Referer": BASE_URL,
-    }
-    if user_id:
-        headers["New-Api-User"] = str(user_id)
+    headers = auth_headers(access_token, user_id)
 
     resp = session.get(url, headers=headers, timeout=20)
     data = safe_json(resp)
     if not data:
         return None
-
     if not data.get("success"):
         print("获取用户信息失败:", data.get("message", ""))
         return None
 
     ud = data.get("data") or {}
-    # 兼容 {data: {user: {...}}} 的嵌套结构
     if isinstance(ud, dict) and "user" in ud and isinstance(ud["user"], dict):
         ud = ud["user"]
     return ud
 
 
-def checkin(session: requests.Session, user_id):
-    """执行签到，返回签到响应的完整 JSON。"""
+def checkin(session: requests.Session, user_id, access_token):
     url = f"{BASE_URL}/api/user/checkin"
-
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-        "Origin": BASE_URL,
-        "Referer": BASE_URL,
-        "New-Api-User": str(user_id),
-    }
+    headers = auth_headers(access_token, user_id, json_body=True)
 
     resp = session.post(url, headers=headers, json={}, timeout=20)
     data = safe_json(resp)
@@ -187,45 +185,40 @@ def main():
 
     session = make_session()
 
-    # 登录
     user = login(session)
     if not user:
         print("\n登录失败，无法继续签到")
         sys.exit(1)
 
-    user_id  = user["id"]
-    username = user.get("username", str(user_id))
+    user_id      = user["id"]
+    username     = user.get("username", str(user_id))
+    access_token = user["access_token"]
 
-    # 获取签到前余额
-    info_before = get_user_info(session, user_id)
+    # 签到前余额
+    info_before = get_user_info(session, user_id, access_token)
     if not info_before:
         print("获取用户信息失败")
         sys.exit(1)
     balance_before = quota_to_dollar(info_before.get("quota", 0))
 
     # 签到
-    checkin_data = checkin(session, user_id)
+    checkin_data = checkin(session, user_id, access_token)
 
-    # 获取签到后余额
-    info_after = get_user_info(session, user_id)
+    # 签到后余额
+    info_after = get_user_info(session, user_id, access_token)
     if not info_after:
         print("获取签到后用户信息失败")
         sys.exit(1)
     balance_after = quota_to_dollar(info_after.get("quota", 0))
 
-    # 判断签到结果
     now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
     success = checkin_data.get("success", False)
     msg = str(checkin_data.get("message", "") or "")
 
     if success:
-        # 签到成功
         awarded_data = checkin_data.get("data") or {}
         awarded_quota = awarded_data.get("quota_awarded", 0) or 0
-        if awarded_quota:
-            awarded_dollar = quota_to_dollar(awarded_quota)
-        else:
-            awarded_dollar = balance_after - balance_before
+        awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
 
         print(f"✅ 签到成功 | 获得: {fmt_usd(awarded_dollar)}$")
 
@@ -240,7 +233,6 @@ def main():
         )
 
     elif any(k in msg for k in ("已签到", "重复签到", "今天已签到")):
-        # 今日已签到
         print(f"✅ 今日已签到 | 当前余额: {fmt_usd(balance_after)}$")
 
         message = (
@@ -254,7 +246,6 @@ def main():
         )
 
     else:
-        # 签到失败
         print(f"❌ 签到失败 | {msg}")
 
         message = (
@@ -267,7 +258,6 @@ def main():
             f"{BASE_URL}"
         )
 
-    # 发送通知
     send_notification(message)
 
 
