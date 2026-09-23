@@ -44,16 +44,16 @@ def safe_json(resp):
 
 
 def quota_to_dollar(quota):
+    """quota -> 美元（float，保留精度）"""
     return quota / QUOTA_PER_UNIT
 
 
 def fmt_usd(v):
-    s = f"{v:.4f}".rstrip("0").rstrip(".")
-    return s if s else "0"
+    """金额格式化为整数（四舍五入），用于余额和签到奖励展示"""
+    return str(round(v))
 
 
 def auth_headers(access_token, user_id=None, json_body=False):
-    """统一生成带 Bearer Token 的请求头"""
     headers = {
         "Accept": "application/json, text/plain, */*",
         "User-Agent": "Mozilla/5.0",
@@ -101,9 +101,9 @@ def login(session: requests.Session):
         print("登录失败:", data.get("message", ""))
         return None
 
-    payload       = data.get("data") or {}
-    access_token  = payload.get("access_token") or ""
-    user_data     = payload.get("user") or {}
+    payload      = data.get("data") or {}
+    access_token = payload.get("access_token") or ""
+    user_data    = payload.get("user") or {}
 
     user_id  = user_data.get("id") or user_data.get("user_id") or user_data.get("uid")
     username = user_data.get("username", "") or ""
@@ -115,7 +115,6 @@ def login(session: requests.Session):
         print("登录成功但未获取到 access_token")
         return None
 
-    # 用 bearer token 更新 session 的默认头，后续请求自动带上
     session.headers.update({
         "Authorization": f"Bearer {access_token}",
         "New-Api-User":  str(user_id),
