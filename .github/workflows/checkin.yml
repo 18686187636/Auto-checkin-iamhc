@@ -200,8 +200,6 @@ jobs:
       - name: Run checkin
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
-          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          USER_ID: ${{ secrets.USER_ID }}
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
