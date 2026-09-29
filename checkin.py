@@ -3,7 +3,9 @@
 
 import os, sys, time, json, requests
 from datetime import datetime, timezone, timedelta
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ★ 换成 patchright（API 完全兼容 playwright）
+from patchright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 EMAIL         = os.environ.get("EMAIL") or ""
 PASSWORD      = os.environ.get("PASSWORD") or ""
@@ -56,44 +58,22 @@ def main():
             "args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--lang=zh-CN",
             ],
         }
         if PROXY_URL:
             launch_opts["proxy"] = {"server": PROXY_URL}
             log(f"→ 浏览器将走代理: {PROXY_URL}")
 
-        log("→ 启动浏览器...")
+        log("→ 启动浏览器 (patchright chromium)...")
         browser = p.chromium.launch(**launch_opts)
         log("  ✅ 浏览器已启动")
 
+        # patchright 已处理指纹，无需额外反检测脚本
         context = browser.new_context(
-            user_agent=UA,
             viewport={"width": 1920, "height": 1080},
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
-            extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
         )
-        # 更完整的反检测脚本
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
-            window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
-            const origQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (params) => (
-                params.name === 'notifications'
-                    ? Promise.resolve({state: Notification.permission})
-                    : origQuery(params)
-            );
-            Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-                get: function() { return window; }
-            });
-        """)
 
         page = context.new_page()
 
@@ -110,7 +90,6 @@ def main():
         except Exception as e:
             log(f"  ⚠️ {e}")
 
-        # 等 turnstile JS 加载
         log("→ 等待 window.turnstile 就绪...")
         for _ in range(30):
             has = page.evaluate("() => typeof window.turnstile !== 'undefined' && !!window.turnstile.render")
@@ -125,26 +104,26 @@ def main():
 
         time.sleep(2)
 
-        # === 关键：手动创建容器 + 渲染 Turnstile ===
+        # === 手动创建容器 + 渲染 Turnstile ===
         log("→ 手动创建 Turnstile 容器并 render")
         render_res = page.evaluate("""(sitekey) => {
             window.__ts_token = null;
             window.__ts_error = null;
+            window.__ts_interactive = false;
             const old = document.getElementById('__manual_ts');
             if (old) old.remove();
             const div = document.createElement('div');
             div.id = '__manual_ts';
-            div.style.cssText = 'position:fixed;top:20px;left:20px;z-index:2147483647;background:#fff;padding:8px;border:2px solid red;';
+            div.style.cssText = 'position:fixed;top:20px;left:20px;z-index:2147483647;background:#fff;padding:8px;';
             document.body.appendChild(div);
             try {
                 const wid = window.turnstile.render(div, {
                     sitekey: sitekey,
-                    callback: (token) => { window.__ts_token = token; console.log('TS_CB_OK'); },
-                    'error-callback': (err) => { window.__ts_error = 'error: ' + String(err); console.log('TS_ERR', err); },
-                    'timeout-callback': () => { window.__ts_error = 'timeout'; console.log('TS_TIMEOUT'); },
-                    'before-interactive-callback': () => { console.log('TS_BEFORE_INTERACTIVE'); window.__ts_interactive = true; },
-                    'after-interactive-callback': () => { console.log('TS_AFTER_INTERACTIVE'); },
-                    'unsupported-callback': () => { window.__ts_error = 'unsupported'; },
+                    callback: (token) => { window.__ts_token = token; },
+                    'error-callback': (err) => { window.__ts_error = 'error: ' + String(err); },
+                    'timeout-callback': () => { window.__ts_error = 'timeout'; },
+                    'before-interactive-callback': () => { window.__ts_interactive = true; },
+                    'after-interactive-callback': () => { window.__ts_interactive = false; },
                 });
                 window.__ts_wid = wid;
                 return {ok: true, wid: wid};
@@ -157,31 +136,14 @@ def main():
 
         time.sleep(3)
 
-        # 检查容器是否渲染出 iframe
-        check1 = page.evaluate("""() => ({
-            div_exists: !!document.getElementById('__manual_ts'),
-            div_html_len: document.getElementById('__manual_ts') ? document.getElementById('__manual_ts').innerHTML.length : 0,
-            iframes_in_div: document.getElementById('__manual_ts') ? document.getElementById('__manual_ts').querySelectorAll('iframe').length : 0,
-            iframe_srcs: document.getElementById('__manual_ts') ? Array.from(document.getElementById('__manual_ts').querySelectorAll('iframe')).map(f => f.src.slice(0, 100)) : [],
-        })""")
+        check1 = page.evaluate("""() => {
+            const d = document.getElementById('__manual_ts');
+            return {
+                div_exists: !!d,
+                iframes_in_div: d ? d.querySelectorAll('iframe').length : 0,
+            };
+        }""")
         log(f"  容器状态: {check1}")
-
-        # === 尝试点击 Turnstile 里的"我是人"框（如果有） ===
-        try:
-            # 找到 turnstile iframe 并尝试点击左上角
-            frames = page.frames
-            for f in frames:
-                if "challenges.cloudflare.com" in f.url:
-                    log(f"  发现 Turnstile iframe: {f.url[:100]}")
-                    try:
-                        # Turnstile 的 checkbox 通常在整个 iframe 的左侧
-                        # 尝试点击坐标
-                        box = f.frame_element().bounding_box() if hasattr(f, 'frame_element') else None
-                    except Exception:
-                        pass
-                    break
-        except Exception:
-            pass
 
         log("→ 等待 Turnstile token（最多 180s）...")
         token = None
@@ -200,18 +162,16 @@ def main():
                 break
             if i % 15 == 0:
                 if state.get("interactive"):
-                    log(f"  ...等待中 {i}s (需要人工交互，尝试自动点击)")
-                    # 尝试点击 turnstile iframe
+                    log(f"  ...等待中 {i}s (尝试自动点击)")
                     try:
                         for fr in page.frames:
                             if "challenges.cloudflare.com" in fr.url:
                                 try:
                                     el = fr.frame_element()
                                     box = el.bounding_box()
-                                    if box:
-                                        # 点击左侧 30px 处（checkbox 位置）
+                                    if box and box["width"] > 0:
                                         page.mouse.click(box["x"] + 20, box["y"] + box["height"] / 2)
-                                        log(f"  点击坐标: ({box['x']+20}, {box['y']+box['height']/2})")
+                                        log(f"  已点击 ({box['x']+20:.0f}, {box['y']+box['height']/2:.0f})")
                                 except Exception as e:
                                     log(f"  点击失败: {e}")
                                 break
@@ -225,11 +185,9 @@ def main():
             log("❌ 未拿到 Turnstile token")
             try:
                 page.screenshot(path="login_fail.png", full_page=True)
-                # 单独截 turnstile 区域
                 el = page.query_selector('#__manual_ts')
                 if el:
                     el.screenshot(path="turnstile_widget.png")
-                log("已保存截图")
             except Exception:
                 pass
             browser.close()
