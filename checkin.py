@@ -7,14 +7,16 @@ from urllib.parse import quote
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-EMAIL         = os.environ.get("EMAIL") or ""
-PASSWORD      = os.environ.get("PASSWORD") or ""
-ACCESS_TOKEN  = os.environ.get("ACCESS_TOKEN") or ""
-USER_ID       = os.environ.get("USER_ID") or ""
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
-TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
+EMAIL          = os.environ.get("EMAIL") or ""
+PASSWORD       = os.environ.get("PASSWORD") or ""
+ACCESS_TOKEN   = os.environ.get("ACCESS_TOKEN") or ""
+USER_ID        = os.environ.get("USER_ID") or ""
+SESSION_COOKIE = os.environ.get("SESSION_COOKIE") or ""
+TG_CHAT_ID     = os.environ.get("TG_CHAT_ID") or ""
+TG_BOT_TOKEN   = os.environ.get("TG_BOT_TOKEN") or ""
 
 BASE_URL = "https://api.hcnsec.cn"
+COOKIE_DOMAIN = "api.hcnsec.cn"
 QUOTA_PER_UNIT = 500000          # 500000 quota = 1$
 TURNSTILE_TOKEN = ""
 
@@ -55,14 +57,19 @@ def fmt_usd(v):
     return str(round(v))
 
 
-def auth_headers(access_token, user_id=None, json_body=False):
-    headers = {
+def base_headers():
+    return {
         "Accept": "application/json, text/plain, */*",
         "User-Agent": "Mozilla/5.0",
         "Origin": BASE_URL,
         "Referer": BASE_URL,
-        "Authorization": f"Bearer {access_token}",
     }
+
+
+def auth_headers(access_token=None, user_id=None, json_body=False):
+    headers = base_headers()
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
     if json_body:
         headers["Content-Type"] = "application/json"
     if user_id:
@@ -70,25 +77,65 @@ def auth_headers(access_token, user_id=None, json_body=False):
     return headers
 
 
+def unwrap_user(data):
+    """兼容 {data: {...}} 与 {data: {user: {...}}}"""
+    ud = data.get("data") or {}
+    if isinstance(ud, dict) and "user" in ud and isinstance(ud["user"], dict):
+        ud = ud["user"]
+    return ud if isinstance(ud, dict) else {}
+
+
 # ---------------------------------------------------------------------------
-# 业务逻辑
+# 登录方式 1：SESSION_COOKIE（方案 A 推荐）
+# ---------------------------------------------------------------------------
+def load_user_from_cookie(session: requests.Session):
+    """用 session cookie 鉴权，跳过登录与 Turnstile"""
+    if not SESSION_COOKIE:
+        return None
+
+    # 注入 cookie（两个都带上，兼容不同版本）
+    session.cookies.set("session", SESSION_COOKIE, domain=COOKIE_DOMAIN, path="/")
+    session.cookies.set("new_api_has_session", "1", domain=COOKIE_DOMAIN, path="/")
+
+    session.headers.update(base_headers())
+
+    url = f"{BASE_URL}/api/user/self"
+    resp = session.get(url, headers=base_headers(), timeout=20)
+    data = safe_json(resp)
+
+    if not data:
+        print("❌ 使用 SESSION_COOKIE 获取用户信息失败（响应非 JSON）")
+        return None
+    if not data.get("success"):
+        msg = data.get("message", "")
+        print(f"❌ SESSION_COOKIE 校验失败: {msg}")
+        print("   可能原因：cookie 已过期 / 被服务端清理 / 复制不完整")
+        return None
+
+    ud = unwrap_user(data)
+    user_id  = ud.get("id") or ud.get("user_id") or ud.get("uid")
+    username = ud.get("username") or ""
+    if not user_id:
+        print("❌ cookie 有效但拿不到 user_id，user_data keys =", list(ud.keys()))
+        return None
+
+    # 后续请求统一带 New-Api-User
+    session.headers.update({
+        "New-Api-User": str(user_id),
+    })
+
+    print(f"✅ 使用 SESSION_COOKIE 登录成功 | 账户: {username} | ID: {user_id}")
+    return {"id": user_id, "username": username, "access_token": ""}
+
+
+# ---------------------------------------------------------------------------
+# 登录方式 2：ACCESS_TOKEN + USER_ID（方案 A 备选）
 # ---------------------------------------------------------------------------
 def load_user_from_token(session: requests.Session):
-    """
-    用已有的 ACCESS_TOKEN + USER_ID 构造会话，跳过登录。
-    通过 /api/user/self 验证 token 是否有效，并取回 username。
-    """
     if not ACCESS_TOKEN or not USER_ID:
         return None
 
-    session.headers.update({
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "New-Api-User":  str(USER_ID),
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0",
-        "Origin": BASE_URL,
-        "Referer": BASE_URL,
-    })
+    session.headers.update(auth_headers(ACCESS_TOKEN, USER_ID))
 
     url = f"{BASE_URL}/api/user/self"
     resp = session.get(url, headers=auth_headers(ACCESS_TOKEN, USER_ID), timeout=20)
@@ -97,38 +144,30 @@ def load_user_from_token(session: requests.Session):
     if not data:
         print("❌ 使用 ACCESS_TOKEN 获取用户信息失败（响应非 JSON）")
         return None
-
     if not data.get("success"):
         msg = data.get("message", "")
         print(f"❌ ACCESS_TOKEN 校验失败: {msg}")
-        print("   可能原因：token 已过期、被重新登录覆盖，或 USER_ID 不匹配")
         return None
 
-    ud = data.get("data") or {}
-    if isinstance(ud, dict) and "user" in ud and isinstance(ud["user"], dict):
-        ud = ud["user"]
-
-    username = (ud.get("username") or "") if isinstance(ud, dict) else ""
-    user_id  = (ud.get("id") or ud.get("user_id") or ud.get("uid") or USER_ID) if isinstance(ud, dict) else USER_ID
+    ud = unwrap_user(data)
+    username = ud.get("username") or ""
+    user_id  = ud.get("id") or ud.get("user_id") or ud.get("uid") or USER_ID
 
     print(f"✅ 使用 ACCESS_TOKEN 登录成功 | 账户: {username} | ID: {user_id}")
     return {"id": user_id, "username": username, "access_token": ACCESS_TOKEN}
 
 
+# ---------------------------------------------------------------------------
+# 登录方式 3：账号密码（原逻辑，兜底；需 Turnstile token）
+# ---------------------------------------------------------------------------
 def login(session: requests.Session):
-    """账号密码登录（原逻辑，作兜底），返回 id / username / access_token"""
     if not EMAIL or not PASSWORD:
         return None
 
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
-
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-        "Origin": BASE_URL,
-        "Referer": f"{BASE_URL}/login",
-    }
+    headers = base_headers()
+    headers["Content-Type"] = "application/json"
+    headers["Referer"] = f"{BASE_URL}/login"
 
     resp = session.post(
         login_url,
@@ -171,6 +210,9 @@ def login(session: requests.Session):
     return {"id": user_id, "username": username, "access_token": access_token}
 
 
+# ---------------------------------------------------------------------------
+# 业务接口
+# ---------------------------------------------------------------------------
 def get_user_info(session: requests.Session, user_id, access_token):
     url = f"{BASE_URL}/api/user/self"
     headers = auth_headers(access_token, user_id)
@@ -183,10 +225,7 @@ def get_user_info(session: requests.Session, user_id, access_token):
         print("获取用户信息失败:", data.get("message", ""))
         return None
 
-    ud = data.get("data") or {}
-    if isinstance(ud, dict) and "user" in ud and isinstance(ud["user"], dict):
-        ud = ud["user"]
-    return ud
+    return unwrap_user(data)
 
 
 def checkin(session: requests.Session, user_id, access_token):
@@ -227,16 +266,15 @@ def send_notification(message):
 def main():
     session = make_session()
 
-    # 优先用 ACCESS_TOKEN（方案 A，跳过 Cloudflare Turnstile）
-    user = load_user_from_token(session)
-
-    # 回退：账号密码登录（需要 Turnstile token，通常不可用）
+    # 优先级：SESSION_COOKIE > ACCESS_TOKEN > 账号密码
+    user = load_user_from_cookie(session)
     if not user:
-        if ACCESS_TOKEN and USER_ID:
-            print("\n⚠️ ACCESS_TOKEN 方式失败，尝试账号密码登录作为兜底...")
+        user = load_user_from_token(session)
+    if not user:
         if not EMAIL or not PASSWORD:
-            print("❌ 未配置 ACCESS_TOKEN/USER_ID，且缺少 EMAIL/PASSWORD，无法登录")
+            print("❌ 未配置任何可用登录方式（SESSION_COOKIE / ACCESS_TOKEN / EMAIL+PASSWORD）")
             sys.exit(1)
+        print("\n⚠️ cookie / token 方式均失败，尝试账号密码登录作为兜底...")
         user = login(session)
 
     if not user:
