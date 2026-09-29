@@ -2,8 +2,9 @@ name: iamhc Daily Checkin
 
 on:
   schedule:
+    # 每天 UTC 23:00 运行（即北京时间次日 07:00）
     - cron: '0 23 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # 支持手动触发
 
 jobs:
   checkin:
@@ -21,141 +22,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Configure sing-box proxy
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-          SING_BOX_VERSION: "1.10.7"
-        run: |
-          set -e
-          if [ -z "$NODE_LINK" ]; then
-            echo "⚠️ NODE_LINK 未配置，跳过 sing-box 代理"
-            exit 0
-          fi
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64|amd64)  SB_ARCH="amd64" ;;
-            aarch64|arm64) SB_ARCH="arm64" ;;
-            *) echo "❌ 不支持的架构: $ARCH"; exit 1 ;;
-          esac
-          PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
-          URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
-          echo "⬇️ 下载 sing-box"
-          download_ok=0
-          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
-            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
-                 -o sing-box.tar.gz "${PREFIX}${URL}"; then
-              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then
-                download_ok=1; break
-              else
-                rm -f sing-box.tar.gz
-              fi
-            fi
-          done
-          if [ "$download_ok" != "1" ]; then
-            echo "❌ sing-box 下载失败"; exit 1
-          fi
-          tar -xzf sing-box.tar.gz
-          SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
-          sudo mv "$SING_BOX_DIR/sing-box" /usr/local/bin/
-          sudo chmod +x /usr/local/bin/sing-box
-          rm -rf sing-box.tar.gz "$SING_BOX_DIR"
-
-          python3 << 'PYEOF'
-          import json, sys, os, re
-          from urllib.parse import urlparse, parse_qs
-          link = os.environ.get('NODE_LINK', '')
-          if not link: sys.exit(0)
-          parsed = urlparse(link)
-          if parsed.scheme != 'vless':
-              print(f"⚠️ 不支持的协议: {parsed.scheme}"); sys.exit(0)
-          netloc = parsed.netloc
-          uuid, host_port = (netloc.split('@', 1) if '@' in netloc else ('', netloc))
-          host, port = '', '443'
-          m = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
-          if m:
-              host = m.group(1); port = m.group(2) or port
-          elif ':' in host_port and host_port.count(':') == 1:
-              host, port = host_port.split(':', 1)
-          else:
-              host = host_port
-          params = parse_qs(parsed.query)
-          sni = params.get('sni', [''])[0] or host
-          fp = params.get('fp', [''])[0] or 'chrome'
-          flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
-          type_ = params.get('type', ['tcp'])[0]
-          security = params.get('security', [''])[0]
-          path = params.get('path', [''])[0]
-          host_header = params.get('host', [''])[0] or host
-          outbound = {
-              "type": "vless", "tag": "vless-out",
-              "server": host, "server_port": int(port),
-              "uuid": uuid, "flow": flow, "packet_encoding": "packetaddr",
-          }
-          if security.lower() != 'none':
-              outbound["tls"] = {"enabled": True, "server_name": sni,
-                                 "insecure": False,
-                                 "utls": {"enabled": True, "fingerprint": fp}}
-          if type_ != 'tcp':
-              t = {"type": type_}
-              if type_ == 'ws':
-                  t["path"] = path or "/"
-                  t["headers"] = {"Host": host_header}
-              elif type_ == 'grpc':
-                  t["service_name"] = path or ""
-              outbound["transport"] = t
-          if security == 'reality':
-              outbound['tls']['reality'] = {
-                  "enabled": True,
-                  "public_key": params.get('pbk', [''])[0],
-                  "short_id": params.get('sid', [''])[0],
-              }
-          cfg = {
-              "log": {"level": "warn"},
-              "inbounds": [
-                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}
-              ],
-              "outbounds": [outbound],
-              "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
-          }
-          with open("sing-box-config.json", "w") as f:
-              json.dump(cfg, f, indent=2)
-          PYEOF
-
-          if [ -f sing-box-config.json ]; then
-            nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
-            sleep 5
-            if ss -tuln | grep -q ':1081'; then
-              echo "✅ sing-box 已启动 (127.0.0.1:1081)"
-            else
-              echo "❌ sing-box 启动失败"; cat sing-box.log; exit 1
-            fi
-          fi
-
-      - name: Install deps
-        run: |
-          pip install requests patchright
-          python -m patchright install --with-deps chromium
-
-          # 安装真实 Chrome —— 直接下 .deb，绕开 GPG
-          echo "→ 下载 Google Chrome .deb"
-          wget -q --tries=3 --timeout=60 \
-            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-            -O /tmp/chrome.deb
-          echo "→ 安装"
-          sudo apt-get install -y /tmp/chrome.deb
-          google-chrome --version
-
-      - name: Diagnose proxy
-        if: always()
-        run: |
-          echo "=== 代理连通性 ==="
-          curl -s -o /dev/null -w "google via proxy: %{http_code} (%{time_total}s)\n" \
-            -x http://127.0.0.1:1081 --max-time 15 https://www.google.com || echo "google 失败"
-          curl -s -o /dev/null -w "hcnsec via proxy: %{http_code} (%{time_total}s)\n" \
-            -x http://127.0.0.1:1081 --max-time 15 https://api.hcnsec.cn/api/status || echo "hcnsec 失败"
-          echo "=== 直连连通性 ==="
-          curl -s -o /dev/null -w "hcnsec direct: %{http_code} (%{time_total}s)\n" \
-            --max-time 15 https://api.hcnsec.cn/api/status || echo "hcnsec 直连失败"
+      - name: Install dependencies
+        run: pip install requests
 
       - name: Run checkin
         env:
@@ -163,31 +31,7 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PYTHONUNBUFFERED: "1"
-        run: |
-          if ss -tuln | grep -q ':1081'; then
-            export PROXY_URL="http://127.0.0.1:1081"
-            echo "✅ 使用代理 $PROXY_URL"
-          else
-            echo "⚠️ 无代理，直连"
-          fi
-          timeout 900 xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-            python3 -u checkin.py
-          echo "脚本退出码: $?"
-
-      - name: Upload fail screenshot
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: login-fail-screenshot
-          path: |
-            login_fail.png
-            turnstile_widget.png
-          if-no-files-found: ignore
-
-      - name: Print sing-box log
-        if: always()
-        run: cat sing-box.log || true
+        run: python checkin.py
 
       - name: clear old run jobs
         if: always()
@@ -199,6 +43,7 @@ jobs:
           for run_id in $runs; do
             count=$((count + 1))
             if [ $count -gt 1 ]; then
+              echo "deleted: $run_id"
               gh run delete $run_id || true
             fi
           done
