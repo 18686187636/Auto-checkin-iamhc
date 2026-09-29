@@ -136,16 +136,13 @@ jobs:
           pip install requests patchright
           python -m patchright install --with-deps chromium
 
-          # 安装真实 Chrome（patchright 用 channel="chrome" 启动）
-          echo "→ 安装 Google Chrome"
-          sudo apt-get update -qq
-          sudo apt-get install -y wget gnupg ca-certificates
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
-            | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
-            | sudo tee /etc/apt/sources.list.d/google-chrome.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y google-chrome-stable
+          # 安装真实 Chrome —— 直接下 .deb，绕开 GPG
+          echo "→ 下载 Google Chrome .deb"
+          wget -q --tries=3 --timeout=60 \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+            -O /tmp/chrome.deb
+          echo "→ 安装"
+          sudo apt-get install -y /tmp/chrome.deb
           google-chrome --version
 
       - name: Diagnose proxy
