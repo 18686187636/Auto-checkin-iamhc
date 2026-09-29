@@ -9,6 +9,8 @@ from urllib3.util.retry import Retry
 
 EMAIL         = os.environ.get("EMAIL") or ""
 PASSWORD      = os.environ.get("PASSWORD") or ""
+ACCESS_TOKEN  = os.environ.get("ACCESS_TOKEN") or ""
+USER_ID       = os.environ.get("USER_ID") or ""
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 
@@ -71,8 +73,53 @@ def auth_headers(access_token, user_id=None, json_body=False):
 # ---------------------------------------------------------------------------
 # 业务逻辑
 # ---------------------------------------------------------------------------
+def load_user_from_token(session: requests.Session):
+    """
+    用已有的 ACCESS_TOKEN + USER_ID 构造会话，跳过登录。
+    通过 /api/user/self 验证 token 是否有效，并取回 username。
+    """
+    if not ACCESS_TOKEN or not USER_ID:
+        return None
+
+    session.headers.update({
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "New-Api-User":  str(USER_ID),
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0",
+        "Origin": BASE_URL,
+        "Referer": BASE_URL,
+    })
+
+    url = f"{BASE_URL}/api/user/self"
+    resp = session.get(url, headers=auth_headers(ACCESS_TOKEN, USER_ID), timeout=20)
+    data = safe_json(resp)
+
+    if not data:
+        print("❌ 使用 ACCESS_TOKEN 获取用户信息失败（响应非 JSON）")
+        return None
+
+    if not data.get("success"):
+        msg = data.get("message", "")
+        print(f"❌ ACCESS_TOKEN 校验失败: {msg}")
+        print("   可能原因：token 已过期、被重新登录覆盖，或 USER_ID 不匹配")
+        return None
+
+    ud = data.get("data") or {}
+    if isinstance(ud, dict) and "user" in ud and isinstance(ud["user"], dict):
+        ud = ud["user"]
+
+    username = (ud.get("username") or "") if isinstance(ud, dict) else ""
+    user_id  = (ud.get("id") or ud.get("user_id") or ud.get("uid") or USER_ID) if isinstance(ud, dict) else USER_ID
+
+    print(f"✅ 使用 ACCESS_TOKEN 登录成功 | 账户: {username} | ID: {user_id}")
+    return {"id": user_id, "username": username, "access_token": ACCESS_TOKEN}
+
+
 def login(session: requests.Session):
-    """登录并返回 id / username / access_token"""
+    """账号密码登录（原逻辑，作兜底），返回 id / username / access_token"""
+    if not EMAIL or not PASSWORD:
+        return None
+
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
 
     headers = {
@@ -178,13 +225,20 @@ def send_notification(message):
 # 主流程
 # ---------------------------------------------------------------------------
 def main():
-    if not EMAIL or not PASSWORD:
-        print("请先设置 EMAIL 和 PASSWORD 环境变量")
-        sys.exit(1)
-
     session = make_session()
 
-    user = login(session)
+    # 优先用 ACCESS_TOKEN（方案 A，跳过 Cloudflare Turnstile）
+    user = load_user_from_token(session)
+
+    # 回退：账号密码登录（需要 Turnstile token，通常不可用）
+    if not user:
+        if ACCESS_TOKEN and USER_ID:
+            print("\n⚠️ ACCESS_TOKEN 方式失败，尝试账号密码登录作为兜底...")
+        if not EMAIL or not PASSWORD:
+            print("❌ 未配置 ACCESS_TOKEN/USER_ID，且缺少 EMAIL/PASSWORD，无法登录")
+            sys.exit(1)
+        user = login(session)
+
     if not user:
         print("\n登录失败，无法继续签到")
         sys.exit(1)
