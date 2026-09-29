@@ -133,8 +133,8 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install requests playwright
-          playwright install --with-deps chromium
+          pip install requests patchright
+          python -m patchright install chromium
 
       - name: Diagnose proxy
         if: always()
@@ -144,16 +144,6 @@ jobs:
             -x http://127.0.0.1:1081 --max-time 15 https://www.google.com || echo "google 失败"
           curl -s -o /dev/null -w "hcnsec via proxy: %{http_code} (%{time_total}s)\n" \
             -x http://127.0.0.1:1081 --max-time 15 https://api.hcnsec.cn/api/status || echo "hcnsec 失败"
-          echo "=== 直连连通性 ==="
-          curl -s -o /dev/null -w "hcnsec direct: %{http_code} (%{time_total}s)\n" \
-            --max-time 15 https://api.hcnsec.cn/api/status || echo "hcnsec 直连失败"
-
-      - name: Diagnose playwright
-        if: always()
-        run: |
-          python3 -c "import playwright; print('playwright imported OK')"
-          ls -la ~/.cache/ms-playwright/ 2>/dev/null || echo "无浏览器缓存目录"
-          find ~/.cache/ms-playwright -name 'chrome' -type f 2>/dev/null | head -5
 
       - name: Run checkin
         env:
@@ -169,7 +159,7 @@ jobs:
           else
             echo "⚠️ 无代理，直连"
           fi
-          timeout 900 xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" \
+          timeout 900 xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
             python3 -u checkin.py
           echo "脚本退出码: $?"
 
@@ -178,7 +168,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: login-fail-screenshot
-          path: login_fail.png
+          path: |
+            login_fail.png
+            turnstile_widget.png
           if-no-files-found: ignore
 
       - name: Print sing-box log
