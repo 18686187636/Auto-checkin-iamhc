@@ -2,9 +2,8 @@ name: iamhc Daily Checkin
 
 on:
   schedule:
-    # 每天 UTC 23:00 运行（即北京时间次日 07:00）
     - cron: '0 23 * * *'
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch:
 
 jobs:
   checkin:
@@ -28,96 +27,57 @@ jobs:
           SING_BOX_VERSION: "1.10.7"
         run: |
           set -e
-
           if [ -z "$NODE_LINK" ]; then
             echo "⚠️ NODE_LINK 未配置，跳过 sing-box 代理"
             exit 0
           fi
-
           ARCH="$(uname -m)"
           case "$ARCH" in
             x86_64|amd64)  SB_ARCH="amd64" ;;
             aarch64|arm64) SB_ARCH="arm64" ;;
             *) echo "❌ 不支持的架构: $ARCH"; exit 1 ;;
           esac
-
           PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
           URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
-
-          echo "⬇️ 下载 sing-box: $URL"
-
+          echo "⬇️ 下载 sing-box"
           download_ok=0
           for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
-            echo "  尝试: ${PREFIX}${URL}"
             if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
                  -o sing-box.tar.gz "${PREFIX}${URL}"; then
               if file sing-box.tar.gz | grep -q 'gzip compressed data'; then
-                echo "  ✅ 下载成功 (${PREFIX:-direct})"
-                download_ok=1
-                break
+                download_ok=1; break
               else
-                echo "  ⚠️ 文件不是 gzip，继续尝试下一个源"
                 rm -f sing-box.tar.gz
               fi
             fi
           done
-
           if [ "$download_ok" != "1" ]; then
-            echo "❌ sing-box 所有下载源均失败"
-            exit 1
+            echo "❌ sing-box 下载失败"; exit 1
           fi
-
           tar -xzf sing-box.tar.gz
           SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
-          if [ -z "$SING_BOX_DIR" ]; then
-            echo "❌ 解压失败"
-            ls -la
-            exit 1
-          fi
           sudo mv "$SING_BOX_DIR/sing-box" /usr/local/bin/
           sudo chmod +x /usr/local/bin/sing-box
           rm -rf sing-box.tar.gz "$SING_BOX_DIR"
-          sing-box version
 
-          echo "📝 解析 vless 链接并生成配置..."
           python3 << 'PYEOF'
           import json, sys, os, re
           from urllib.parse import urlparse, parse_qs
-
           link = os.environ.get('NODE_LINK', '')
-          if not link:
-              sys.exit(0)
-
+          if not link: sys.exit(0)
           parsed = urlparse(link)
           if parsed.scheme != 'vless':
-              print(f"⚠️ 不支持的协议: {parsed.scheme}，跳过")
-              sys.exit(0)
-
+              print(f"⚠️ 不支持的协议: {parsed.scheme}"); sys.exit(0)
           netloc = parsed.netloc
-          if '@' in netloc:
-              uuid, host_port = netloc.split('@', 1)
+          uuid, host_port = (netloc.split('@', 1) if '@' in netloc else ('', netloc))
+          host, port = '', '443'
+          m = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
+          if m:
+              host = m.group(1); port = m.group(2) or port
+          elif ':' in host_port and host_port.count(':') == 1:
+              host, port = host_port.split(':', 1)
           else:
-              uuid, host_port = '', netloc
-
-          host = ''
-          port = '443'
-          bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
-          if bracket_match:
-              host = bracket_match.group(1)
-              if bracket_match.group(2):
-                  port = bracket_match.group(2)
-          else:
-              if host_port.count(':') > 1:
-                  host = host_port
-              elif ':' in host_port:
-                  host, port = host_port.split(':', 1)
-              else:
-                  host = host_port
-
-          if not host:
-              print(f"❌ 无法解析 host: {host_port}")
-              sys.exit(1)
-
+              host = host_port
           params = parse_qs(parsed.query)
           sni = params.get('sni', [''])[0] or host
           fp = params.get('fp', [''])[0] or 'chrome'
@@ -126,95 +86,78 @@ jobs:
           security = params.get('security', [''])[0]
           path = params.get('path', [''])[0]
           host_header = params.get('host', [''])[0] or host
-
           outbound = {
-              "type": "vless",
-              "tag": "vless-out",
-              "server": host,
-              "server_port": int(port),
-              "uuid": uuid,
-              "flow": flow,
-              "packet_encoding": "packetaddr",
+              "type": "vless", "tag": "vless-out",
+              "server": host, "server_port": int(port),
+              "uuid": uuid, "flow": flow, "packet_encoding": "packetaddr",
           }
-
           if security.lower() != 'none':
-              outbound["tls"] = {
-                  "enabled": True,
-                  "server_name": sni,
-                  "insecure": False,
-                  "utls": {"enabled": True, "fingerprint": fp}
-              }
-
+              outbound["tls"] = {"enabled": True, "server_name": sni,
+                                 "insecure": False,
+                                 "utls": {"enabled": True, "fingerprint": fp}}
           if type_ != 'tcp':
-              transport = {"type": type_}
+              t = {"type": type_}
               if type_ == 'ws':
-                  transport["path"] = path or "/"
-                  transport["headers"] = {"Host": host_header}
+                  t["path"] = path or "/"
+                  t["headers"] = {"Host": host_header}
               elif type_ == 'grpc':
-                  transport["service_name"] = path or ""
-              outbound["transport"] = transport
-
+                  t["service_name"] = path or ""
+              outbound["transport"] = t
           if security == 'reality':
-              pbk = params.get('pbk', [''])[0]
-              sid = params.get('sid', [''])[0]
               outbound['tls']['reality'] = {
                   "enabled": True,
-                  "public_key": pbk,
-                  "short_id": sid
+                  "public_key": params.get('pbk', [''])[0],
+                  "short_id": params.get('sid', [''])[0],
               }
-
-          config = {
+          cfg = {
               "log": {"level": "warn"},
               "inbounds": [
-                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
-                  {"type": "http",  "tag": "http-in",  "listen": "127.0.0.1", "listen_port": 1081}
+                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}
               ],
               "outbounds": [outbound],
               "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
           }
-
           with open("sing-box-config.json", "w") as f:
-              json.dump(config, f, indent=2)
-          print("✅ sing-box-config.json 已生成")
+              json.dump(cfg, f, indent=2)
           PYEOF
 
           if [ -f sing-box-config.json ]; then
-            echo "🚀 启动 sing-box..."
             nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
             sleep 5
-            if ss -tuln | grep -q ':1080'; then
-              echo "✅ SOCKS5 代理已启动 (127.0.0.1:1080)"
-              echo "✅ HTTP  代理已启动 (127.0.0.1:1081)"
+            if ss -tuln | grep -q ':1081'; then
+              echo "✅ sing-box 已启动 (127.0.0.1:1081)"
             else
-              echo "❌ 代理启动失败，日志如下:"
-              cat sing-box.log
-              exit 1
+              echo "❌ sing-box 启动失败"; cat sing-box.log; exit 1
             fi
-          else
-            echo "⚠️ 未生成配置文件，跳过代理启动"
           fi
 
-      - name: Install dependencies
-        run: pip install requests
+      - name: Install deps
+        run: |
+          pip install requests playwright
+          playwright install --with-deps chromium
 
       - name: Run checkin
         env:
-          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          # 若 sing-box HTTP 代理监听成功，则让 Python 走代理；否则直连
           if ss -tuln | grep -q ':1081'; then
-            export HTTP_PROXY="http://127.0.0.1:1081"
-            export HTTPS_PROXY="http://127.0.0.1:1081"
-            export NO_PROXY="localhost,127.0.0.1"
-            echo "✅ 检测到 sing-box 代理，checkin 将通过 127.0.0.1:1081 访问"
+            export PROXY_URL="http://127.0.0.1:1081"
+            echo "✅ 使用代理 $PROXY_URL"
           else
-            echo "⚠️ 未检测到 sing-box 代理，checkin 将直连"
+            echo "⚠️ 无代理，直连"
           fi
-          python checkin.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" python checkin.py
+
+      - name: Upload fail screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: login-fail-screenshot
+          path: login_fail.png
+          if-no-files-found: ignore
 
       - name: Print sing-box log
         if: always()
@@ -230,7 +173,6 @@ jobs:
           for run_id in $runs; do
             count=$((count + 1))
             if [ $count -gt 1 ]; then
-              echo "deleted: $run_id"
               gh run delete $run_id || true
             fi
           done
