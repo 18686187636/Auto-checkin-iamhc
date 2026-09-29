@@ -1,3 +1,0 @@
-# iamhc 自动签到依赖
-requests>=2.31.0
-patchright>=1.0.0
