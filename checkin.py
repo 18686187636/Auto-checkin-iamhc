@@ -9,14 +9,11 @@ from urllib3.util.retry import Retry
 
 EMAIL          = os.environ.get("EMAIL") or ""
 PASSWORD       = os.environ.get("PASSWORD") or ""
-ACCESS_TOKEN   = os.environ.get("ACCESS_TOKEN") or ""
-USER_ID        = os.environ.get("USER_ID") or ""
 SESSION_COOKIE = os.environ.get("SESSION_COOKIE") or ""
 TG_CHAT_ID     = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN   = os.environ.get("TG_BOT_TOKEN") or ""
 
 BASE_URL = "https://api.hcnsec.cn"
-COOKIE_DOMAIN = "api.hcnsec.cn"
 QUOTA_PER_UNIT = 500000          # 500000 quota = 1$
 TURNSTILE_TOKEN = ""
 
@@ -66,10 +63,10 @@ def base_headers():
     }
 
 
-def auth_headers(access_token=None, user_id=None, json_body=False):
+def auth_headers(user_id=None, json_body=False, cookie=None):
     headers = base_headers()
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
+    if cookie:
+        headers["Cookie"] = cookie
     if json_body:
         headers["Content-Type"] = "application/json"
     if user_id:
@@ -86,21 +83,18 @@ def unwrap_user(data):
 
 
 # ---------------------------------------------------------------------------
-# 登录方式 1：SESSION_COOKIE（方案 A 推荐）
+# 登录方式 1：SESSION_COOKIE（推荐，长期有效）
 # ---------------------------------------------------------------------------
 def load_user_from_cookie(session: requests.Session):
     """用 session cookie 鉴权，跳过登录与 Turnstile"""
     if not SESSION_COOKIE:
         return None
 
-    # 注入 cookie（两个都带上，兼容不同版本）
-    session.cookies.set("session", SESSION_COOKIE, domain=COOKIE_DOMAIN, path="/")
-    session.cookies.set("new_api_has_session", "1", domain=COOKIE_DOMAIN, path="/")
-
-    session.headers.update(base_headers())
+    # 用 header 形式发送 cookie，避免 requests 的 domain 匹配问题
+    cookie_header = f"session={SESSION_COOKIE}; new_api_has_session=1"
 
     url = f"{BASE_URL}/api/user/self"
-    resp = session.get(url, headers=base_headers(), timeout=20)
+    resp = session.get(url, headers=auth_headers(cookie=cookie_header), timeout=20)
     data = safe_json(resp)
 
     if not data:
@@ -119,46 +113,18 @@ def load_user_from_cookie(session: requests.Session):
         print("❌ cookie 有效但拿不到 user_id，user_data keys =", list(ud.keys()))
         return None
 
-    # 后续请求统一带 New-Api-User
+    # 后续请求统一带 Cookie 和 New-Api-User
     session.headers.update({
+        "Cookie": cookie_header,
         "New-Api-User": str(user_id),
     })
 
     print(f"✅ 使用 SESSION_COOKIE 登录成功 | 账户: {username} | ID: {user_id}")
-    return {"id": user_id, "username": username, "access_token": ""}
+    return {"id": user_id, "username": username, "cookie": cookie_header}
 
 
 # ---------------------------------------------------------------------------
-# 登录方式 2：ACCESS_TOKEN + USER_ID（方案 A 备选）
-# ---------------------------------------------------------------------------
-def load_user_from_token(session: requests.Session):
-    if not ACCESS_TOKEN or not USER_ID:
-        return None
-
-    session.headers.update(auth_headers(ACCESS_TOKEN, USER_ID))
-
-    url = f"{BASE_URL}/api/user/self"
-    resp = session.get(url, headers=auth_headers(ACCESS_TOKEN, USER_ID), timeout=20)
-    data = safe_json(resp)
-
-    if not data:
-        print("❌ 使用 ACCESS_TOKEN 获取用户信息失败（响应非 JSON）")
-        return None
-    if not data.get("success"):
-        msg = data.get("message", "")
-        print(f"❌ ACCESS_TOKEN 校验失败: {msg}")
-        return None
-
-    ud = unwrap_user(data)
-    username = ud.get("username") or ""
-    user_id  = ud.get("id") or ud.get("user_id") or ud.get("uid") or USER_ID
-
-    print(f"✅ 使用 ACCESS_TOKEN 登录成功 | 账户: {username} | ID: {user_id}")
-    return {"id": user_id, "username": username, "access_token": ACCESS_TOKEN}
-
-
-# ---------------------------------------------------------------------------
-# 登录方式 3：账号密码（原逻辑，兜底；需 Turnstile token）
+# 登录方式 2：账号密码（兜底；需 Turnstile token，通常不可用）
 # ---------------------------------------------------------------------------
 def login(session: requests.Session):
     if not EMAIL or not PASSWORD:
@@ -207,15 +173,15 @@ def login(session: requests.Session):
     })
 
     print(f"✅ 登录成功 | 账户: {username} | ID: {user_id}")
-    return {"id": user_id, "username": username, "access_token": access_token}
+    return {"id": user_id, "username": username, "cookie": None}
 
 
 # ---------------------------------------------------------------------------
 # 业务接口
 # ---------------------------------------------------------------------------
-def get_user_info(session: requests.Session, user_id, access_token):
+def get_user_info(session: requests.Session, user_id, cookie=None):
     url = f"{BASE_URL}/api/user/self"
-    headers = auth_headers(access_token, user_id)
+    headers = auth_headers(user_id, cookie=cookie)
 
     resp = session.get(url, headers=headers, timeout=20)
     data = safe_json(resp)
@@ -228,9 +194,9 @@ def get_user_info(session: requests.Session, user_id, access_token):
     return unwrap_user(data)
 
 
-def checkin(session: requests.Session, user_id, access_token):
+def checkin(session: requests.Session, user_id, cookie=None):
     url = f"{BASE_URL}/api/user/checkin"
-    headers = auth_headers(access_token, user_id, json_body=True)
+    headers = auth_headers(user_id, json_body=True, cookie=cookie)
 
     resp = session.post(url, headers=headers, json={}, timeout=20)
     data = safe_json(resp)
@@ -266,37 +232,35 @@ def send_notification(message):
 def main():
     session = make_session()
 
-    # 优先级：SESSION_COOKIE > ACCESS_TOKEN > 账号密码
+    # 优先 SESSION_COOKIE
     user = load_user_from_cookie(session)
     if not user:
-        user = load_user_from_token(session)
-    if not user:
         if not EMAIL or not PASSWORD:
-            print("❌ 未配置任何可用登录方式（SESSION_COOKIE / ACCESS_TOKEN / EMAIL+PASSWORD）")
+            print("❌ SESSION_COOKIE 失效，且未配置 EMAIL/PASSWORD，无法登录")
             sys.exit(1)
-        print("\n⚠️ cookie / token 方式均失败，尝试账号密码登录作为兜底...")
+        print("\n⚠️ SESSION_COOKIE 方式失败，尝试账号密码登录作为兜底...")
         user = login(session)
 
     if not user:
         print("\n登录失败，无法继续签到")
         sys.exit(1)
 
-    user_id      = user["id"]
-    username     = user.get("username", str(user_id))
-    access_token = user["access_token"]
+    user_id  = user["id"]
+    username = user.get("username", str(user_id))
+    cookie   = user.get("cookie")
 
     # 签到前余额
-    info_before = get_user_info(session, user_id, access_token)
+    info_before = get_user_info(session, user_id, cookie)
     if not info_before:
         print("获取用户信息失败")
         sys.exit(1)
     balance_before = quota_to_dollar(info_before.get("quota", 0))
 
     # 签到
-    checkin_data = checkin(session, user_id, access_token)
+    checkin_data = checkin(session, user_id, cookie)
 
     # 签到后余额
-    info_after = get_user_info(session, user_id, access_token)
+    info_after = get_user_info(session, user_id, cookie)
     if not info_after:
         print("获取签到后用户信息失败")
         sys.exit(1)
