@@ -9,21 +9,27 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    timeout-minutes: 15          # 防止浏览器卡死
     permissions:
       actions: write
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: |
+          pip install patchright requests
+          patchright install --with-deps chromium
+
+      - name: Install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Run checkin
         env:
@@ -31,9 +37,12 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python checkin.py
+          BROWSER_PROXY: ${{ secrets.BROWSER_PROXY }}   # 可选，强烈建议配置
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python checkin.py
 
-      - name: clear old run jobs
+      - name: Clear old run jobs
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
