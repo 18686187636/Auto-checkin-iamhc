@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, time, json, requests
+import os, sys, time, json, requests, shutil, tempfile
 from datetime import datetime, timezone, timedelta
 
-# ★ 换成 patchright（API 完全兼容 playwright）
 from patchright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 EMAIL         = os.environ.get("EMAIL") or ""
@@ -17,9 +16,6 @@ BASE_URL = "https://api.hcnsec.cn"
 TURNSTILE_SITEKEY = "0x4AAAAAAFIovBqwE9xMkrm_"
 QUOTA_PER_UNIT = 500000
 TZ_CN = timezone(timedelta(hours=8))
-
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
 def log(*a):
@@ -51,31 +47,35 @@ def main():
         sys.exit(1)
 
     now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
+    user_data_dir = tempfile.mkdtemp(prefix="pw-user-")
 
     with sync_playwright() as p:
         launch_opts = {
+            "user_data_dir": user_data_dir,
             "headless": False,
+            "channel": "chrome",           # 用真实 Chrome，比 Chromium 指纹更真
             "args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--start-maximized",
             ],
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
         }
         if PROXY_URL:
             launch_opts["proxy"] = {"server": PROXY_URL}
             log(f"→ 浏览器将走代理: {PROXY_URL}")
 
-        log("→ 启动浏览器 (patchright chromium)...")
-        browser = p.chromium.launch(**launch_opts)
+        log("→ 启动浏览器 (patchright + chrome + persistent)...")
+        try:
+            context = p.chromium.launch_persistent_context(**launch_opts)
+        except Exception as e:
+            log(f"  ❌ 启动失败: {e}")
+            sys.exit(1)
         log("  ✅ 浏览器已启动")
 
-        # patchright 已处理指纹，无需额外反检测脚本
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-        )
-
-        page = context.new_page()
+        page = context.pages[0] if context.pages else context.new_page()
 
         def on_response(r):
             u = r.url
@@ -85,27 +85,56 @@ def main():
 
         log(f"→ 打开 {BASE_URL}/login")
         try:
-            page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=60000)
+            page.goto(f"{BASE_URL}/login", wait_until="load", timeout=90000)
             log("  ✅ 页面已加载")
         except Exception as e:
             log(f"  ⚠️ {e}")
 
-        log("→ 等待 window.turnstile 就绪...")
-        for _ in range(30):
-            has = page.evaluate("() => typeof window.turnstile !== 'undefined' && !!window.turnstile.render")
-            if has:
-                log("  ✅ window.turnstile.render 可用")
+        # === 等待 turnstile 脚本就绪（最长 90s） ===
+        log("→ 等待 window.turnstile 就绪（最多 90s）...")
+        ready = False
+        for i in range(90):
+            info = page.evaluate("""() => ({
+                ts_type: typeof window.turnstile,
+                render_type: (typeof window.turnstile !== 'undefined') ? typeof window.turnstile.render : 'n/a',
+                readyState: document.readyState,
+            })""")
+            if info.get("render_type") == "function":
+                log(f"  ✅ turnstile 就绪（等待 {i}s）")
+                ready = True
                 break
+            if i % 5 == 0:
+                log(f"  ...{i}s  ts={info.get('ts_type')}  render={info.get('render_type')}  rs={info.get('readyState')}")
             time.sleep(1)
-        else:
-            log("  ❌ 30s 内 turnstile 未就绪")
-            browser.close()
+
+        if not ready:
+            log("  ⚠️ 90s 未就绪，尝试主动注入 api.js")
+            try:
+                page.add_script_tag(
+                    url="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+                )
+                time.sleep(5)
+                ok = page.evaluate("() => typeof window.turnstile !== 'undefined' && !!window.turnstile.render")
+                if ok:
+                    log("  ✅ 主动注入成功")
+                    ready = True
+            except Exception as e:
+                log(f"  ❌ 主动注入失败: {e}")
+
+        if not ready:
+            log("❌ turnstile 无法就绪，退出")
+            try:
+                page.screenshot(path="login_fail.png", full_page=True)
+            except Exception:
+                pass
+            context.close()
+            shutil.rmtree(user_data_dir, ignore_errors=True)
             sys.exit(1)
 
         time.sleep(2)
 
-        # === 手动创建容器 + 渲染 Turnstile ===
-        log("→ 手动创建 Turnstile 容器并 render")
+        # === 手动 render ===
+        log("→ 手动 render Turnstile")
         render_res = page.evaluate("""(sitekey) => {
             window.__ts_token = null;
             window.__ts_error = null;
@@ -120,32 +149,29 @@ def main():
                 const wid = window.turnstile.render(div, {
                     sitekey: sitekey,
                     callback: (token) => { window.__ts_token = token; },
-                    'error-callback': (err) => { window.__ts_error = 'error: ' + String(err); },
+                    'error-callback': (err) => { window.__ts_error = 'error:' + String(err); },
                     'timeout-callback': () => { window.__ts_error = 'timeout'; },
                     'before-interactive-callback': () => { window.__ts_interactive = true; },
                     'after-interactive-callback': () => { window.__ts_interactive = false; },
                 });
-                window.__ts_wid = wid;
                 return {ok: true, wid: wid};
             } catch(e) {
-                window.__ts_error = 'render exception: ' + e.message;
                 return {ok: false, err: e.message};
             }
         }""", TURNSTILE_SITEKEY)
-        log(f"  render 结果: {render_res}")
+        log(f"  render: {render_res}")
 
         time.sleep(3)
-
-        check1 = page.evaluate("""() => {
+        st = page.evaluate("""() => {
             const d = document.getElementById('__manual_ts');
             return {
-                div_exists: !!d,
                 iframes_in_div: d ? d.querySelectorAll('iframe').length : 0,
+                inner_html_len: d ? d.innerHTML.length : 0,
             };
         }""")
-        log(f"  容器状态: {check1}")
+        log(f"  容器: {st}")
 
-        log("→ 等待 Turnstile token（最多 180s）...")
+        log("→ 等待 token（最多 180s）...")
         token = None
         for i in range(180):
             state = page.evaluate("""() => ({
@@ -155,14 +181,14 @@ def main():
             })""")
             if state.get("token"):
                 token = state["token"]
-                log(f"  ✅ 拿到 token: {token[:50]}...")
+                log(f"  ✅ token: {token[:50]}...")
                 break
             if state.get("error"):
-                log(f"  ❌ Turnstile 报错: {state['error']}")
+                log(f"  ❌ CF 报错: {state['error']}")
                 break
             if i % 15 == 0:
+                log(f"  ...{i}s  interactive={state.get('interactive')}")
                 if state.get("interactive"):
-                    log(f"  ...等待中 {i}s (尝试自动点击)")
                     try:
                         for fr in page.frames:
                             if "challenges.cloudflare.com" in fr.url:
@@ -171,18 +197,16 @@ def main():
                                     box = el.bounding_box()
                                     if box and box["width"] > 0:
                                         page.mouse.click(box["x"] + 20, box["y"] + box["height"] / 2)
-                                        log(f"  已点击 ({box['x']+20:.0f}, {box['y']+box['height']/2:.0f})")
+                                        log(f"  已点击 ({box['x']+20:.0f},{box['y']+box['height']/2:.0f})")
                                 except Exception as e:
                                     log(f"  点击失败: {e}")
                                 break
                     except Exception:
                         pass
-                else:
-                    log(f"  ...等待中 {i}s")
             time.sleep(1)
 
         if not token:
-            log("❌ 未拿到 Turnstile token")
+            log("❌ 未拿到 token")
             try:
                 page.screenshot(path="login_fail.png", full_page=True)
                 el = page.query_selector('#__manual_ts')
@@ -190,10 +214,11 @@ def main():
                     el.screenshot(path="turnstile_widget.png")
             except Exception:
                 pass
-            browser.close()
+            context.close()
+            shutil.rmtree(user_data_dir, ignore_errors=True)
             sys.exit(1)
 
-        # === 用 token 登录 ===
+        # === 登录 ===
         log("→ 调用登录接口")
         login_result = page.evaluate("""async ({turnstile, username, password}) => {
             try {
@@ -211,7 +236,6 @@ def main():
                 return {success: false, message: 'fetch error: ' + String(e)};
             }
         }""", {"turnstile": token, "username": EMAIL, "password": PASSWORD})
-
         log(f"  登录返回: success={login_result.get('success')} msg={login_result.get('message','')}")
 
         if not login_result.get("success"):
@@ -220,13 +244,14 @@ def main():
                 page.screenshot(path="login_fail.png", full_page=True)
             except Exception:
                 pass
-            browser.close()
+            context.close()
+            shutil.rmtree(user_data_dir, ignore_errors=True)
             sys.exit(1)
 
         log("✅ 登录成功")
 
         # === 签到 ===
-        log("→ 调用签到接口")
+        log("→ 签到")
         checkin_result = page.evaluate("""async () => {
             try {
                 const r = await fetch('/api/user/checkin', {
@@ -248,9 +273,10 @@ def main():
             } catch(e) { return {success: false}; }
         }""")
 
-        browser.close()
+        context.close()
+        shutil.rmtree(user_data_dir, ignore_errors=True)
 
-    # ---- 解析结果 ----
+    # ---- 结果 ----
     success = checkin_result.get("success", False)
     msg = str(checkin_result.get("message", "") or "")
 
