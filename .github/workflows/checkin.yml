@@ -169,7 +169,7 @@ jobs:
           else
             echo "⚠️ 无代理，直连"
           fi
-          timeout 360 xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" \
+          timeout 600 xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" \
             python3 -u checkin.py
           echo "脚本退出码: $?"
 
