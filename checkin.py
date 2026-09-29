@@ -12,6 +12,7 @@ TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 PROXY_URL     = os.environ.get("PROXY_URL") or ""
 
 BASE_URL = "https://api.hcnsec.cn"
+TURNSTILE_SITEKEY = "0x4AAAAAAFIovBqwE9xMkrm_"
 QUOTA_PER_UNIT = 500000
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -56,6 +57,8 @@ def main():
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--lang=zh-CN",
             ],
         }
         if PROXY_URL:
@@ -68,204 +71,171 @@ def main():
 
         context = browser.new_context(
             user_agent=UA,
-            viewport={"width": 1366, "height": 768},
+            viewport={"width": 1920, "height": 1080},
             locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
         )
+        # 更完整的反检测脚本
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+            window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
+            const origQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (params) => (
+                params.name === 'notifications'
+                    ? Promise.resolve({state: Notification.permission})
+                    : origQuery(params)
+            );
+            Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+                get: function() { return window; }
+            });
         """)
 
         page = context.new_page()
 
         def on_response(r):
             u = r.url
-            if ("hcnsec" in u) or ("cloudflare" in u) or ("turnstile" in u) or ("challenges" in u):
-                log(f"  [net] {r.status} {u}")
+            if ("hcnsec" in u) or ("cloudflare" in u) or ("turnstile" in u):
+                log(f"  [net] {r.status} {u[:160]}")
         page.on("response", on_response)
 
-        def on_request_failed(req):
-            log(f"  [FAIL] {req.url} - {req.failure}")
-        page.on("requestfailed", on_request_failed)
-
-        log(f"→ 打开登录页 {BASE_URL}/login")
+        log(f"→ 打开 {BASE_URL}/login")
         try:
-            page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=60000)
+            page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=60000)
             log("  ✅ 页面已加载")
         except Exception as e:
-            log(f"  ⚠️ networkidle 超时，继续: {e}")
+            log(f"  ⚠️ {e}")
+
+        # 等 turnstile JS 加载
+        log("→ 等待 window.turnstile 就绪...")
+        for _ in range(30):
+            has = page.evaluate("() => typeof window.turnstile !== 'undefined' && !!window.turnstile.render")
+            if has:
+                log("  ✅ window.turnstile.render 可用")
+                break
+            time.sleep(1)
+        else:
+            log("  ❌ 30s 内 turnstile 未就绪")
+            browser.close()
+            sys.exit(1)
+
+        time.sleep(2)
+
+        # === 关键：手动创建容器 + 渲染 Turnstile ===
+        log("→ 手动创建 Turnstile 容器并 render")
+        render_res = page.evaluate("""(sitekey) => {
+            window.__ts_token = null;
+            window.__ts_error = null;
+            const old = document.getElementById('__manual_ts');
+            if (old) old.remove();
+            const div = document.createElement('div');
+            div.id = '__manual_ts';
+            div.style.cssText = 'position:fixed;top:20px;left:20px;z-index:2147483647;background:#fff;padding:8px;border:2px solid red;';
+            document.body.appendChild(div);
+            try {
+                const wid = window.turnstile.render(div, {
+                    sitekey: sitekey,
+                    callback: (token) => { window.__ts_token = token; console.log('TS_CB_OK'); },
+                    'error-callback': (err) => { window.__ts_error = 'error: ' + String(err); console.log('TS_ERR', err); },
+                    'timeout-callback': () => { window.__ts_error = 'timeout'; console.log('TS_TIMEOUT'); },
+                    'before-interactive-callback': () => { console.log('TS_BEFORE_INTERACTIVE'); window.__ts_interactive = true; },
+                    'after-interactive-callback': () => { console.log('TS_AFTER_INTERACTIVE'); },
+                    'unsupported-callback': () => { window.__ts_error = 'unsupported'; },
+                });
+                window.__ts_wid = wid;
+                return {ok: true, wid: wid};
+            } catch(e) {
+                window.__ts_error = 'render exception: ' + e.message;
+                return {ok: false, err: e.message};
+            }
+        }""", TURNSTILE_SITEKEY)
+        log(f"  render 结果: {render_res}")
 
         time.sleep(3)
 
-        # === 诊断 Turnstile 环境 ===
-        log("→ 诊断 Turnstile 环境")
-        env = page.evaluate("""() => {
-            const r = {
-                has_turnstile_js: typeof window.turnstile !== 'undefined',
-                turnstile_keys: window.turnstile ? Object.keys(window.turnstile) : [],
-                cf_elements: document.querySelectorAll('.cf-turnstile').length,
-                sitekey_elements: document.querySelectorAll('[data-sitekey]').length,
-                cf_iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length,
-                all_iframes: document.querySelectorAll('iframe').length,
-                iframe_srcs: Array.from(document.querySelectorAll('iframe')).map(f => f.src).slice(0, 10),
-                scripts: Array.from(document.querySelectorAll('script[src]')).map(s => s.src).filter(s => s.includes('turnstile') || s.includes('cloudflare')),
-                sitekeys: Array.from(document.querySelectorAll('[data-sitekey]')).map(el => el.getAttribute('data-sitekey')),
-            };
-            return r;
-        }""")
-        log(f"  window.turnstile 存在: {env['has_turnstile_js']}")
-        log(f"  turnstile API keys: {env['turnstile_keys']}")
-        log(f"  .cf-turnstile 元素数: {env['cf_elements']}")
-        log(f"  [data-sitekey] 元素数: {env['sitekey_elements']}")
-        log(f"  cloudflare iframe 数: {env['cf_iframes']}")
-        log(f"  iframe 总数: {env['all_iframes']}")
-        log(f"  iframe srcs: {env['iframe_srcs']}")
-        log(f"  turnstile/cf script: {env['scripts']}")
-        log(f"  sitekeys: {env['sitekeys']}")
+        # 检查容器是否渲染出 iframe
+        check1 = page.evaluate("""() => ({
+            div_exists: !!document.getElementById('__manual_ts'),
+            div_html_len: document.getElementById('__manual_ts') ? document.getElementById('__manual_ts').innerHTML.length : 0,
+            iframes_in_div: document.getElementById('__manual_ts') ? document.getElementById('__manual_ts').querySelectorAll('iframe').length : 0,
+            iframe_srcs: document.getElementById('__manual_ts') ? Array.from(document.getElementById('__manual_ts').querySelectorAll('iframe')).map(f => f.src.slice(0, 100)) : [],
+        })""")
+        log(f"  容器状态: {check1}")
 
-        log("→ 等待表单渲染")
+        # === 尝试点击 Turnstile 里的"我是人"框（如果有） ===
         try:
-            page.wait_for_selector('input', timeout=30000)
-        except PWTimeout:
-            log("  ❌ 30s 内未出现 input 元素")
-            try:
-                page.screenshot(path="login_fail.png", full_page=True)
-            except Exception:
-                pass
-            browser.close()
-            sys.exit(1)
-
-        log("→ 填写账号")
-        for sel in ['input[name="username"]', 'input[type="email"]',
-                    'input[placeholder*="邮箱"]', 'input[placeholder*="用户"]']:
-            try:
-                page.fill(sel, EMAIL, timeout=3000)
-                log(f"  已填账号: {sel}")
-                break
-            except PWTimeout:
-                continue
-
-        log("→ 填写密码")
-        for sel in ['input[type="password"]', 'input[name="password"]']:
-            try:
-                page.fill(sel, PASSWORD, timeout=3000)
-                log(f"  已填密码: {sel}")
-                break
-            except PWTimeout:
-                continue
-
-        log("→ 勾选用户协议")
-        agreed = False
-        for sel in ['[role="checkbox"]', 'input[type="checkbox"]',
-                    'button[role="checkbox"]', '[data-state="unchecked"]']:
-            try:
-                els = page.query_selector_all(sel)
-                for el in els:
+            # 找到 turnstile iframe 并尝试点击左上角
+            frames = page.frames
+            for f in frames:
+                if "challenges.cloudflare.com" in f.url:
+                    log(f"  发现 Turnstile iframe: {f.url[:100]}")
                     try:
-                        el.click(force=True, timeout=3000)
-                        agreed = True
-                        log(f"  ✅ 点击 {sel}")
-                        break
+                        # Turnstile 的 checkbox 通常在整个 iframe 的左侧
+                        # 尝试点击坐标
+                        box = f.frame_element().bounding_box() if hasattr(f, 'frame_element') else None
                     except Exception:
-                        continue
-                if agreed:
+                        pass
                     break
-            except Exception:
-                continue
-        log("  ✅ 已勾选" if agreed else "  ⚠️ 未勾选成功")
-        time.sleep(2)
+        except Exception:
+            pass
 
-        # === 勾选后再看一次 Turnstile 环境 ===
-        log("→ 勾选后再次诊断 Turnstile")
-        env2 = page.evaluate("""() => {
-            return {
-                has_turnstile_js: typeof window.turnstile !== 'undefined',
-                cf_elements: document.querySelectorAll('.cf-turnstile').length,
-                sitekey_elements: document.querySelectorAll('[data-sitekey]').length,
-                cf_iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length,
-                sitekeys: Array.from(document.querySelectorAll('[data-sitekey]')).map(el => el.getAttribute('data-sitekey')),
-            };
-        }""")
-        log(f"  {env2}")
-
-        # === 主动尝试调用 turnstile.execute() ===
-        log("→ 主动尝试触发 Turnstile 执行")
-        try:
-            exec_result = page.evaluate("""() => {
-                if (typeof window.turnstile === 'undefined') return 'no turnstile js';
-                const els = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-                if (els.length === 0) return 'no container';
-                const results = [];
-                for (const el of els) {
-                    try {
-                        let wid = el.getAttribute('data-widget-id');
-                        if (!wid) {
-                            try {
-                                wid = window.turnstile.render(el, {
-                                    sitekey: el.getAttribute('data-sitekey'),
-                                    callback: (t) => { window.__turnstile_token = t; }
-                                });
-                                results.push('render:' + wid);
-                            } catch(e) {
-                                results.push('render-err:' + e.message);
-                            }
-                        }
-                        try {
-                            if (wid) {
-                                window.turnstile.execute(wid);
-                                results.push('execute:' + wid);
-                            }
-                        } catch(e) {
-                            results.push('execute-err:' + e.message);
-                        }
-                    } catch(e) {
-                        results.push('err:' + e.message);
-                    }
-                }
-                return results.join(' | ');
-            }""")
-            log(f"  执行结果: {exec_result}")
-        except Exception as e:
-            log(f"  ⚠️ 主动执行失败: {e}")
-
-        log("→ 等待 Turnstile token（最多 120s）...")
+        log("→ 等待 Turnstile token（最多 180s）...")
         token = None
-        for i in range(120):
-            token = page.evaluate("""() => {
-                if (window.__turnstile_token) return window.__turnstile_token;
-                if (window.turnstile && window.turnstile.getResponse) {
-                    const els = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-                    for (const el of els) {
-                        try {
-                            const r = window.turnstile.getResponse(el);
-                            if (r && r.length > 20) return r;
-                        } catch(e) {}
-                    }
-                }
-                const inp = document.querySelector(
-                    'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
-                );
-                if (inp && inp.value && inp.value.length > 20) return inp.value;
-                return null;
-            }""")
-            if token:
-                log(f"  ✅ 拿到 Turnstile token: {token[:40]}...")
+        for i in range(180):
+            state = page.evaluate("""() => ({
+                token: window.__ts_token,
+                error: window.__ts_error,
+                interactive: !!window.__ts_interactive,
+            })""")
+            if state.get("token"):
+                token = state["token"]
+                log(f"  ✅ 拿到 token: {token[:50]}...")
                 break
-            if i % 10 == 0:
-                log(f"  ...等待中 {i}s")
+            if state.get("error"):
+                log(f"  ❌ Turnstile 报错: {state['error']}")
+                break
+            if i % 15 == 0:
+                if state.get("interactive"):
+                    log(f"  ...等待中 {i}s (需要人工交互，尝试自动点击)")
+                    # 尝试点击 turnstile iframe
+                    try:
+                        for fr in page.frames:
+                            if "challenges.cloudflare.com" in fr.url:
+                                try:
+                                    el = fr.frame_element()
+                                    box = el.bounding_box()
+                                    if box:
+                                        # 点击左侧 30px 处（checkbox 位置）
+                                        page.mouse.click(box["x"] + 20, box["y"] + box["height"] / 2)
+                                        log(f"  点击坐标: ({box['x']+20}, {box['y']+box['height']/2})")
+                                except Exception as e:
+                                    log(f"  点击失败: {e}")
+                                break
+                    except Exception:
+                        pass
+                else:
+                    log(f"  ...等待中 {i}s")
             time.sleep(1)
 
         if not token:
-            log("❌ 120s 内未拿到 Turnstile token")
+            log("❌ 未拿到 Turnstile token")
             try:
                 page.screenshot(path="login_fail.png", full_page=True)
-                log("已保存截图 login_fail.png")
+                # 单独截 turnstile 区域
+                el = page.query_selector('#__manual_ts')
+                if el:
+                    el.screenshot(path="turnstile_widget.png")
+                log("已保存截图")
             except Exception:
                 pass
             browser.close()
             sys.exit(1)
 
-        # === 登录 ===
+        # === 用 token 登录 ===
         log("→ 调用登录接口")
         login_result = page.evaluate("""async ({turnstile, username, password}) => {
             try {
@@ -287,42 +257,9 @@ def main():
         log(f"  登录返回: success={login_result.get('success')} msg={login_result.get('message','')}")
 
         if not login_result.get("success"):
-            log("→ fetch 登录失败，尝试点击登录按钮...")
-            clicked = False
-            for sel in [
-                'button[type="submit"]:not([disabled])',
-                'button:has-text("登录"):not([disabled])',
-                'button:has-text("Login"):not([disabled])',
-            ]:
-                try:
-                    page.click(sel, timeout=5000, force=True)
-                    clicked = True
-                    log(f"  ✅ 点击 {sel}")
-                    break
-                except PWTimeout:
-                    continue
-
-            if clicked:
-                try:
-                    page.wait_for_url("**/dashboard/**", timeout=30000)
-                except PWTimeout:
-                    pass
-                time.sleep(2)
-                check = page.evaluate("""async () => {
-                    try {
-                        const r = await fetch('/api/user/self', {credentials: 'include'});
-                        return await r.json();
-                    } catch(e) { return {success: false}; }
-                }""")
-                if check.get("success"):
-                    log("  ✅ UI 登录成功")
-                    login_result = {"success": True}
-
-        if not login_result.get("success"):
             log(f"❌ 登录失败: {login_result.get('message','')}")
             try:
                 page.screenshot(path="login_fail.png", full_page=True)
-                log("已保存截图 login_fail.png")
             except Exception:
                 pass
             browser.close()
