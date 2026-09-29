@@ -19,13 +19,17 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
+def log(*a):
+    print(*a, flush=True)
+
+
 def fmt_usd(v): return str(round(v))
 
 
 def send_notification(message):
-    print("\n" + "=" * 25)
-    print(message)
-    print("=" * 25)
+    log("\n" + "=" * 25)
+    log(message)
+    log("=" * 25)
     if TG_BOT_TOKEN and TG_CHAT_ID:
         try:
             r = requests.post(
@@ -33,14 +37,14 @@ def send_notification(message):
                 json={"chat_id": TG_CHAT_ID, "text": message},
                 timeout=10,
             )
-            print("Telegram:", r.status_code)
+            log("Telegram:", r.status_code)
         except Exception as e:
-            print("Telegram 失败:", e)
+            log("Telegram 失败:", e)
 
 
 def main():
     if not EMAIL or not PASSWORD:
-        print("请先设置 EMAIL 和 PASSWORD")
+        log("请先设置 EMAIL 和 PASSWORD")
         sys.exit(1)
 
     now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
@@ -56,8 +60,12 @@ def main():
         }
         if PROXY_URL:
             launch_opts["proxy"] = {"server": PROXY_URL}
+            log(f"→ 浏览器将走代理: {PROXY_URL}")
 
+        log("→ 启动浏览器...")
         browser = p.chromium.launch(**launch_opts)
+        log("  ✅ 浏览器已启动")
+
         context = browser.new_context(
             user_agent=UA,
             viewport={"width": 1366, "height": 768},
@@ -69,34 +77,53 @@ def main():
         """)
 
         page = context.new_page()
-        page.on("response", lambda r: print(f"  [net] {r.status} {r.url}") if "hcnsec" in r.url else None)
+        page.on("response", lambda r: log(f"  [net] {r.status} {r.url}") if "hcnsec" in r.url else None)
 
-        print("→ 打开登录页")
-        page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=60000)
+        log(f"→ 打开登录页 {BASE_URL}/login")
+        try:
+            page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=60000)
+            log("  ✅ 页面已加载")
+        except Exception as e:
+            log(f"  ❌ 打开登录页失败: {e}")
+            try:
+                page.screenshot(path="login_fail.png", full_page=True)
+            except Exception:
+                pass
+            browser.close()
+            sys.exit(1)
 
-        # 等表单渲染
-        page.wait_for_selector('input', timeout=30000)
+        log("→ 等待表单渲染")
+        try:
+            page.wait_for_selector('input', timeout=30000)
+        except PWTimeout:
+            log("  ❌ 30s 内未出现 input 元素")
+            try:
+                page.screenshot(path="login_fail.png", full_page=True)
+            except Exception:
+                pass
+            browser.close()
+            sys.exit(1)
 
-        # 填邮箱
-        print("→ 填写账号")
+        log("→ 填写账号")
         for sel in ['input[type="email"]', 'input[name="username"]',
                     'input[placeholder*="邮箱"]', 'input[placeholder*="用户"]']:
             try:
                 page.fill(sel, EMAIL, timeout=3000)
+                log(f"  已填账号: {sel}")
                 break
             except PWTimeout:
                 continue
 
-        # 填密码
+        log("→ 填写密码")
         for sel in ['input[type="password"]', 'input[name="password"]']:
             try:
                 page.fill(sel, PASSWORD, timeout=3000)
+                log(f"  已填密码: {sel}")
                 break
             except PWTimeout:
                 continue
 
-        # 勾选用户协议
-        print("→ 勾选用户协议")
+        log("→ 勾选用户协议")
         agreed = False
         for sel in [
             'input[type="checkbox"]',
@@ -110,6 +137,7 @@ def main():
                     try:
                         el.click(force=True, timeout=3000)
                         agreed = True
+                        log(f"  ✅ 点击 {sel}")
                         break
                     except Exception:
                         continue
@@ -130,24 +158,24 @@ def main():
                     if box and box.as_element():
                         box.as_element().click(force=True, timeout=3000)
                         agreed = True
+                        log("  ✅ 备用方式勾选成功")
             except Exception as e:
-                print(f"  ⚠️ 备用方式失败: {e}")
+                log(f"  ⚠️ 备用方式失败: {e}")
 
-        print("  ✅ 已勾选" if agreed else "  ⚠️ 未勾选成功")
+        log("  ✅ 已勾选" if agreed else "  ⚠️ 未勾选成功")
         time.sleep(1)
 
-        # 等 Turnstile
-        print("→ 等待 Turnstile widget 加载...")
+        log("→ 等待 Turnstile widget 加载...")
         try:
             page.wait_for_selector(
                 'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [class*="turnstile"]',
                 timeout=30000,
             )
-            print("  ✅ Turnstile widget 已加载")
+            log("  ✅ Turnstile widget 已加载")
         except PWTimeout:
-            print("  ⚠️ 未检测到 Turnstile，继续...")
+            log("  ⚠️ 未检测到 Turnstile，继续...")
 
-        print("→ 等待 Turnstile 自动通过（最多 60s）...")
+        log("→ 等待 Turnstile 自动通过（最多 60s）...")
         token = None
         for i in range(60):
             token = page.evaluate("""() => {
@@ -167,21 +195,23 @@ def main():
                 return null;
             }""")
             if token:
-                print(f"  ✅ 拿到 Turnstile token: {token[:40]}...")
+                log(f"  ✅ 拿到 Turnstile token: {token[:40]}...")
                 break
+            if i % 10 == 0:
+                log(f"  ...等待中 {i}s")
             time.sleep(1)
 
         if not token:
-            print("❌ 60s 内未拿到 Turnstile token")
+            log("❌ 60s 内未拿到 Turnstile token")
             try:
                 page.screenshot(path="login_fail.png", full_page=True)
+                log("已保存截图 login_fail.png")
             except Exception:
                 pass
             browser.close()
             sys.exit(1)
 
-        # 直接 fetch 登录
-        print("→ 调用登录接口")
+        log("→ 调用登录接口")
         login_result = page.evaluate("""async ({turnstile, username, password}) => {
             try {
                 const r = await fetch('/api/user/login?turnstile=' + encodeURIComponent(turnstile), {
@@ -199,11 +229,10 @@ def main():
             }
         }""", {"turnstile": token, "username": EMAIL, "password": PASSWORD})
 
-        print(f"  登录返回: success={login_result.get('success')} msg={login_result.get('message','')}")
+        log(f"  登录返回: success={login_result.get('success')} msg={login_result.get('message','')}")
 
-        # 兜底：点按钮
         if not login_result.get("success"):
-            print("→ fetch 登录失败，尝试点击登录按钮...")
+            log("→ fetch 登录失败，尝试点击登录按钮...")
             clicked = False
             for sel in [
                 'button[type="submit"]:not([disabled])',
@@ -213,7 +242,7 @@ def main():
                 try:
                     page.click(sel, timeout=5000, force=True)
                     clicked = True
-                    print(f"  ✅ 点击 {sel}")
+                    log(f"  ✅ 点击 {sel}")
                     break
                 except PWTimeout:
                     continue
@@ -231,22 +260,22 @@ def main():
                     } catch(e) { return {success: false}; }
                 }""")
                 if check.get("success"):
-                    print("  ✅ UI 登录成功")
+                    log("  ✅ UI 登录成功")
                     login_result = {"success": True}
 
         if not login_result.get("success"):
-            print(f"❌ 登录失败: {login_result.get('message','')}")
+            log(f"❌ 登录失败: {login_result.get('message','')}")
             try:
                 page.screenshot(path="login_fail.png", full_page=True)
+                log("已保存截图 login_fail.png")
             except Exception:
                 pass
             browser.close()
             sys.exit(1)
 
-        print("✅ 登录成功")
+        log("✅ 登录成功")
 
-        # 签到
-        print("→ 调用签到接口")
+        log("→ 调用签到接口")
         checkin_result = page.evaluate("""async () => {
             try {
                 const r = await fetch('/api/user/checkin', {
@@ -258,7 +287,9 @@ def main():
                 return await r.json();
             } catch(e) { return {success: false, message: String(e)}; }
         }""")
+        log(f"  签到返回: {json.dumps(checkin_result, ensure_ascii=False)[:300]}")
 
+        log("→ 获取用户信息")
         user_info = page.evaluate("""async () => {
             try {
                 const r = await fetch('/api/user/self', {credentials: 'include'});
@@ -268,7 +299,7 @@ def main():
 
         browser.close()
 
-    # ---- 解析 ----
+    # ---- 解析结果 ----
     success = checkin_result.get("success", False)
     msg = str(checkin_result.get("message", "") or "")
 
