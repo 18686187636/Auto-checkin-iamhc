@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-iamhc 纯浏览器自动签到 v7
-点击"立即签到" → CF 自动通过 → 精确读取"今天 +¥XX.XX"奖励金额
-"""
-
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
 
