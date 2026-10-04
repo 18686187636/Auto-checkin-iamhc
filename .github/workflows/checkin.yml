@@ -2,7 +2,7 @@ name: iamhc Daily Checkin
 
 on:
   schedule:
-    - cron: '0 23 * * *'
+    - cron: '0 23 * * *'   # UTC 23:00 = 北京时间次日 07:00
   workflow_dispatch:
 
 jobs:
@@ -25,11 +25,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            xvfb libxi6 libnss3 libxss1 libasound2t64 \
-            libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
-            libgbm1 libgtk-3-0 libpangocairo-1.0-0 \
-            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-            fonts-liberation xdg-utils
+            xvfb \
+            libxi6 \
+            libnss3 \
+            libxss1 \
+            libasound2t64 \
+            libatk-bridge2.0-0 \
+            libatk1.0-0 \
+            libcups2 \
+            libdrm2 \
+            libgbm1 \
+            libgtk-3-0 \
+            libpangocairo-1.0-0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            fonts-liberation \
+            xdg-utils
 
       - name: Install Google Chrome
         run: |
@@ -48,6 +61,8 @@ jobs:
         env:
           EMAIL:        ${{ secrets.EMAIL }}
           PASSWORD:     ${{ secrets.PASSWORD }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          USER_ID:      ${{ secrets.USER_ID }}
           COOKIES:      ${{ secrets.COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
