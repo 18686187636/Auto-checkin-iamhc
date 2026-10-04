@@ -3,7 +3,7 @@
 
 """
 iamhc 自动签到脚本
-认证优先级：COOKIES（自动刷新 access_token） > 浏览器登录兜底
+认证优先级：COOKIES（用 new_api_refresh 换 access_token） > 浏览器登录兜底
 """
 
 import os, sys, time, json, requests
@@ -97,44 +97,42 @@ def fmt_usd(v):         return str(round(v))
 
 
 # ===========================================================================
-# 用 new_api_refresh cookie 换 access_token（关键新增）
+# 用 new_api_refresh cookie 换 access_token（修正端点为 /api/user/auth/refresh）
 # ===========================================================================
 def refresh_access_token(session):
     """
-    使用 new_api_refresh cookie 调 /api/user/auth，
+    使用 new_api_refresh cookie 调 /api/user/auth/refresh，
     返回 (access_token, user_id)，失败返回 (None, None)。
     """
-    endpoints = [
-        f"{BASE_URL}/api/user/auth",
-        f"{BASE_URL}/api/user/refresh",
-        f"{BASE_URL}/api/user/token",
-    ]
-    for url in endpoints:
+    url = f"{BASE_URL}/api/user/auth/refresh"
+    try:
+        r = session.post(url, json={}, timeout=20)
+        print(f"    POST {url} -> HTTP {r.status_code}")
+        if r.status_code != 200:
+            print(f"      响应: {r.text[:200]}")
+            return None, None
         try:
-            r = session.post(url, json={}, timeout=20)
-            print(f"    POST {url} -> HTTP {r.status_code}")
-            if r.status_code == 200:
-                try:
-                    d = r.json()
-                except ValueError:
-                    print(f"      响应非 JSON: {r.text[:150]}")
-                    continue
-                if d.get("success"):
-                    payload = d.get("data") or {}
-                    token = (payload.get("access_token")
-                             or payload.get("token")
-                             or "")
-                    ud = payload.get("user") or {}
-                    uid = (ud.get("id") or ud.get("user_id") or ud.get("uid"))
-                    if not uid and payload.get("id"):
-                        uid = payload.get("id")
-                    if token and uid:
-                        print(f"    ✅ 刷新成功 | token 长度 {len(token)} | USER_ID={uid}")
-                        return token, uid
-                    print(f"      成功但缺少字段: {list(payload.keys())}")
-        except Exception as e:
-            print(f"    {url} 异常: {e}")
-    return None, None
+            d = r.json()
+        except ValueError:
+            print(f"      响应非 JSON: {r.text[:150]}")
+            return None, None
+        if not d.get("success"):
+            print(f"      业务失败: {d.get('message', '')}")
+            return None, None
+        payload = d.get("data") or {}
+        token = (payload.get("access_token")
+                 or payload.get("token")
+                 or "")
+        ud = payload.get("user") or payload
+        uid = (ud.get("id") or ud.get("user_id") or ud.get("uid"))
+        if token and uid:
+            print(f"    ✅ 刷新成功 | token 长度 {len(token)} | USER_ID={uid}")
+            return token, uid
+        print(f"      成功但缺少字段: {list(payload.keys())}")
+        return None, None
+    except Exception as e:
+        print(f"    {url} 异常: {e}")
+        return None, None
 
 
 # ===========================================================================
@@ -214,24 +212,28 @@ def get_auth_via_browser():
                 print("⚠️ 未检测到 URL 变化")
                 sb.save_screenshot("login_failed.png")
 
-            # 提取 cookies
+            # 等待前端写入 Cookie 和 localStorage
+            print("⏳ 等待前端写入 cookie/localStorage…")
+            sb.sleep(5)
+
+            # 提取 cookies（多渠道尝试）
             print("🍪 提取 cookies…")
             cookies = {}
             try:
                 raw = sb.driver.get_cookies()
                 if raw:
                     cookies = {c["name"]: c["value"] for c in raw}
-                    print(f"  driver.get_cookies: {len(cookies)} 个")
+                    print(f"  driver.get_cookies: {len(cookies)} 个 -> {list(cookies.keys())}")
             except Exception as e:
                 print(f"  driver.get_cookies 失败: {e}")
 
-            if not cookies:
+            if len(cookies) < 2:
                 try:
                     raw = sb.execute_cdp_cmd("Network.getAllCookies", {})
                     clist = raw.get("cookies", [])
                     if clist:
                         cookies = {c["name"]: c["value"] for c in clist}
-                        print(f"  CDP getAllCookies: {len(cookies)} 个")
+                        print(f"  CDP getAllCookies: {len(cookies)} 个 -> {list(cookies.keys())}")
                 except Exception as e:
                     print(f"  CDP getAllCookies 失败: {e}")
 
@@ -264,6 +266,8 @@ def get_auth_via_browser():
                     d = json.loads(auth_json)
                     access_token = d.get("token", "")
                     user_id = d.get("uid")
+                    if access_token:
+                        print(f"  localStorage: 找到 access_token（长度 {len(access_token)}）")
             except Exception as e:
                 print(f"  localStorage 提取失败: {e}")
 
@@ -279,7 +283,8 @@ def get_auth_via_browser():
                 print("📋 可选：ACCESS_TOKEN / USER_ID")
                 print(f"ACCESS_TOKEN = {access_token}")
                 print(f"USER_ID      = {user_id}")
-                print("=" * 70 + "\n")
+                print("=" * 70)
+            print()
 
             return access_token, user_id, cookies
 
@@ -316,7 +321,7 @@ def main():
     session = None
     info = None
 
-    # ---------- 优先级 1：ACCESS_TOKEN + USER_ID ----------
+    # ---------- 优先级 1：ACCESS_TOKEN + USER_ID（如果手动配置了） ----------
     if ACCESS_TOKEN and USER_ID:
         print(f"🔑 尝试 ACCESS_TOKEN（长度 {len(ACCESS_TOKEN)}）+ USER_ID={USER_ID}")
         session = make_session_with_token(ACCESS_TOKEN, USER_ID)
@@ -329,17 +334,17 @@ def main():
     else:
         print("ℹ️ 未配置 ACCESS_TOKEN/USER_ID")
 
-    # ---------- 优先级 2：COOKIES（含自动刷新） ----------
+    # ---------- 优先级 2：COOKIES（用 new_api_refresh 换 token） ----------
     if session is None and COOKIES:
         print("🔑 尝试 COOKIES…")
         cookie_dict = parse_cookie_string(COOKIES)
         print(f"  解析到 {len(cookie_dict)} 个 cookie: {list(cookie_dict.keys())}")
 
-        # 先用 cookies 直接试 /api/user/self
+        # 2.1 先直接用 cookies 试 /api/user/self
         session = make_session_with_cookies(cookie_dict)
         info = get_user_info(session)
 
-        # 失败 → 用 new_api_refresh 换 access_token
+        # 2.2 失败 → 用 new_api_refresh 换 access_token
         if not info and "new_api_refresh" in cookie_dict:
             print("  直接调用失败，用 new_api_refresh 刷新 access_token…")
             token, uid = refresh_access_token(session)
@@ -362,12 +367,14 @@ def main():
         print("🌐 回退到浏览器登录…")
         access_token, user_id, cookies = get_auth_via_browser()
 
+        # 3.1 优先用 access_token 直接调
         if access_token and user_id:
             session = make_session_with_token(access_token, user_id)
             info = get_user_info(session)
 
+        # 3.2 access_token 无效 → 用浏览器拿到的 cookies 换
         if (not info) and cookies:
-            # 尝试用新 cookies 调 refresh
+            print("  用浏览器 cookies 刷新 access_token…")
             s2 = make_session_with_cookies(cookies)
             token, uid = refresh_access_token(s2)
             if token and uid:
