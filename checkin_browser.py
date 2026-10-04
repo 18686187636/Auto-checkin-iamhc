@@ -4,6 +4,7 @@
 """
 iamhc 自动签到脚本
 优先使用 COOKIES 环境变量；无效时用浏览器登录（账号密码）兜底。
+登录成功后自动打印 cookie 字符串，方便更新 GitHub Secrets。
 """
 
 import os, sys, time, json, requests
@@ -12,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 # ---- 环境变量 ----
 EMAIL        = os.environ.get("EMAIL") or ""
 PASSWORD     = os.environ.get("PASSWORD") or ""
-COOKIES      = os.environ.get("COOKIES") or ""          # 手动获取，格式: "k1=v1; k2=v2; ..."
+COOKIES      = os.environ.get("COOKIES") or ""
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
@@ -25,7 +26,7 @@ LOGIN_PATH = "/sign-in"
 
 
 # ===========================================================================
-# 工具
+# 工具函数
 # ===========================================================================
 def parse_cookie_string(s):
     """把 "k1=v1; k2=v2" 解析成 dict"""
@@ -39,6 +40,7 @@ def parse_cookie_string(s):
 
 
 def make_api_session(cookies):
+    """构造带 cookie 的 requests.Session"""
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -54,6 +56,7 @@ def make_api_session(cookies):
 
 
 def get_user_info(session):
+    """获取用户信息，成功返回 dict，失败返回 None"""
     r = session.get(f"{BASE_URL}/api/user/self", timeout=20)
     try:
         d = r.json()
@@ -70,6 +73,7 @@ def get_user_info(session):
 
 
 def checkin(session):
+    """签到"""
     r = session.post(f"{BASE_URL}/api/user/checkin", json={}, timeout=20)
     try:
         return r.json()
@@ -93,11 +97,12 @@ def get_cookies_via_browser():
 
     with SB(
         uc=True,
-        test=True,
         headed=True,
+        xvfb=False,              # 外部 xvfb-run 已提供 DISPLAY
         incognito=True,
         locale_code="zh-CN",
         window_size="1920,1080",
+        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
     ) as sb:
         try:
             # 1. 打开登录页
@@ -188,7 +193,7 @@ def get_cookies_via_browser():
             print("🍪 提取 cookies…")
             cookies = {}
 
-            # 方式 1：sb.driver.get_cookies()
+            # 方式 1：Selenium 标准 driver.get_cookies() —— 最可靠
             try:
                 raw = sb.driver.get_cookies()
                 if raw:
@@ -197,7 +202,7 @@ def get_cookies_via_browser():
             except Exception as e:
                 print(f"  方式1 失败: {e}")
 
-            # 方式 2：sb.get_all_cookies()
+            # 方式 2：SeleniumBase get_all_cookies()
             if not cookies:
                 try:
                     raw = sb.get_all_cookies()
@@ -207,7 +212,7 @@ def get_cookies_via_browser():
                 except Exception as e:
                     print(f"  方式2 失败: {e}")
 
-            # 方式 3：Network.getAllCookies（CDP）
+            # 方式 3：CDP Network.getAllCookies —— 包含 HttpOnly
             if not cookies:
                 try:
                     raw = sb.execute_cdp_cmd("Network.getAllCookies", {})
@@ -218,10 +223,10 @@ def get_cookies_via_browser():
                 except Exception as e:
                     print(f"  方式3 失败: {e}")
 
-            # 方式 4：Network.getCookies 只拿当前 URL
+            # 方式 4：CDP Network.getCookies 限定 URL
             if not cookies:
                 try:
-                    raw = sb.execute_cdp_cmd("Network.getCookies", {"urls": [BASE_URL]})
+                    raw = sb.execute_cdp_cmd("Network.getCookies", {"urls": [BASE_URL, LOGIN_URL]})
                     clist = raw.get("cookies", [])
                     if clist:
                         cookies = {c["name"]: c["value"] for c in clist}
@@ -229,7 +234,7 @@ def get_cookies_via_browser():
                 except Exception as e:
                     print(f"  方式4 失败: {e}")
 
-            # 方式 5：document.cookie（只能拿非 HttpOnly 的）
+            # 方式 5：document.cookie（只能拿非 HttpOnly）
             if not cookies:
                 try:
                     raw = sb.execute_script("return document.cookie")
@@ -243,25 +248,14 @@ def get_cookies_via_browser():
                 except Exception as e:
                     print(f"  方式5 失败: {e}")
 
-            # 方式 6：Network.getCookies 拿 login 页面域下的所有 cookie
-            if not cookies:
-                try:
-                    raw = sb.execute_cdp_cmd("Network.getCookies", {"urls": [LOGIN_URL, BASE_URL]})
-                    clist = raw.get("cookies", [])
-                    if clist:
-                        cookies = {c["name"]: c["value"] for c in clist}
-                        print(f"  方式6 Network.getCookies(login): {len(cookies)} 个")
-                except Exception as e:
-                    print(f"  方式6 失败: {e}")
-
+            # 打印成一行，方便复制到 GitHub Secrets
             if cookies:
-                # 打印成一行，方便复制到 GitHub Secrets
                 cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
-                print("\n" + "=" * 60)
-                print("📋 请把以下内容复制到 GitHub Secrets 的 COOKIES 变量：")
-                print("=" * 60)
+                print("\n" + "=" * 70)
+                print("📋 请把以下内容完整复制到 GitHub Secrets 的 COOKIES 变量：")
+                print("=" * 70)
                 print(cookie_str)
-                print("=" * 60 + "\n")
+                print("=" * 70 + "\n")
 
             print(f"✅ 最终提取到 {len(cookies)} 个 cookies: {list(cookies.keys())}")
             return cookies if cookies else None
@@ -297,6 +291,7 @@ def send_notification(message):
 # ===========================================================================
 def main():
     session = None
+    info = None
 
     # ---------- 路径 1：优先用 COOKIES 环境变量 ----------
     if COOKIES:
