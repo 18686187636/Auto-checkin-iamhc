@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+iamhc 纯浏览器自动签到 v6
+精确匹配"立即签到"按钮 → 点击 → 无条件处理 CF → 等 15 秒 → 读结果
+"""
+
 import os, sys, time, json, requests
 from datetime import datetime, timezone, timedelta
 
@@ -35,44 +40,6 @@ def send_notification(message):
 
 
 # ===========================================================================
-# 工具：检测页面上的 Turnstile 弹窗 / token
-# ===========================================================================
-def check_turnstile_present(sb):
-    """检测页面上是否有 CF Turnstile 组件（iframe / container）"""
-    return sb.execute_script("""
-        (function() {
-            // iframe 检测
-            const iframes = document.querySelectorAll('iframe');
-            for (let f of iframes) {
-                const src = f.src || '';
-                if (src.includes('challenges.cloudflare.com') ||
-                    src.includes('turnstile')) {
-                    return true;
-                }
-            }
-            // 容器检测
-            if (document.querySelector('div.cf-turnstile')) return true;
-            if (document.querySelector('[id*="turnstile"]')) return true;
-            if (document.querySelector('[class*="turnstile"]')) return true;
-            return false;
-        })()
-    """)
-
-
-def check_turnstile_token(sb):
-    """检查是否有已生成的 Turnstile token，返回 token 长度（0 表示无）"""
-    return sb.execute_script("""
-        (function() {
-            const inputs = document.querySelectorAll('[name="cf-turnstile-response"]');
-            for (let inp of inputs) {
-                if (inp.value && inp.value.length > 0) return inp.value.length;
-            }
-            return 0;
-        })()
-    """)
-
-
-# ===========================================================================
 # 浏览器流程
 # ===========================================================================
 def browser_checkin():
@@ -81,8 +48,8 @@ def browser_checkin():
     result = {
         "logged_in": False,
         "checkin_clicked": False,
-        "turnstile_passed": False,
-        "button_text": "",
+        "button_before": "",
+        "button_after": "",
         "toast": "",
         "error": "",
     }
@@ -108,7 +75,6 @@ def browser_checkin():
             print("⏳ 等待登录表单…")
             sb.wait_for_element_visible("input[name='username']", timeout=30)
             sb.wait_for_element_visible("input[name='password']", timeout=10)
-            print("✅ 表单已加载")
 
             print("✍️ 填写登录凭证…")
             sb.type("input[name='username']", EMAIL)
@@ -175,85 +141,110 @@ def browser_checkin():
                 return result
 
             # ===========================================================
-            # 3. 定位并点击"立即签到"
+            # 3. 精确匹配"立即签到"按钮
             # ===========================================================
-            print("🖱️ 定位签到按钮…")
-            btn_selector = sb.execute_script("""
+            print("🔍 查找'立即签到'按钮（精确匹配）…")
+            btn_info = sb.execute_script("""
                 (function() {
-                    const elems = document.querySelectorAll('button, a, [role="button"]');
-                    for (let i = 0; i < elems.length; i++) {
-                        const t = (elems[i].textContent || '').trim();
-                        if (t === '立即签到' || t.includes('签到')) {
-                            elems[i].setAttribute('data-checkin-btn', '1');
-                            return '[data-checkin-btn="1"]';
+                    const elems = document.querySelectorAll('button');
+                    let found = null;
+                    // 优先精确匹配
+                    for (let e of elems) {
+                        const t = (e.textContent || '').trim();
+                        if (t === '立即签到') {
+                            found = e;
+                            break;
                         }
                     }
-                    return '';
+                    // 其次匹配以"立即签到"开头（防止空格）
+                    if (!found) {
+                        for (let e of elems) {
+                            const t = (e.textContent || '').trim();
+                            if (t.startsWith('立即签到')) {
+                                found = e;
+                                break;
+                            }
+                        }
+                    }
+                    if (found) {
+                        found.setAttribute('data-checkin-target', '1');
+                        return JSON.stringify({
+                            ok: true,
+                            text: (found.textContent || '').trim(),
+                            tag: found.tagName,
+                            disabled: found.disabled
+                        });
+                    }
+                    // 返回所有 button 文字用于排查
+                    return JSON.stringify({
+                        ok: false,
+                        all_buttons: Array.from(elems).map(e => (e.textContent || '').trim()).filter(Boolean)
+                    });
                 })()
             """)
+            print(f"  按钮查找结果: {btn_info}")
 
-            if not btn_selector:
-                print("⚠️ 未找到签到按钮")
-                result["error"] = "未找到签到按钮"
+            try:
+                info = json.loads(btn_info)
+            except Exception:
+                info = {"ok": False}
+
+            if not info.get("ok"):
+                print("⚠️ 未找到'立即签到'按钮")
+                result["error"] = "未找到立即签到按钮"
                 sb.save_screenshot("no_checkin_button.png")
                 return result
 
-            print("🖱️ 点击签到按钮…")
-            sb.uc_click(btn_selector, reconnect_time=2)
+            result["button_before"] = info.get("text", "")
+            print(f"  ✅ 找到按钮: '{info.get('text')}' (tag={info.get('tag')})")
+
+            # ===========================================================
+            # 4. 点击签到按钮
+            # ===========================================================
+            print("🖱️ 点击'立即签到'…")
+            sb.uc_click("[data-checkin-target='1']", reconnect_time=2)
             result["checkin_clicked"] = True
-            result["button_text"] = "立即签到"
-            print("✅ 已点击签到按钮")
+            print("✅ 已点击")
 
             # ===========================================================
-            # 4. 等待 CF 弹窗并处理（关键！）
+            # 5. 等 CF 弹窗出现（3 秒）
             # ===========================================================
-            print("⏳ 等待签到 CF 弹窗出现（最多 10 秒）…")
-            sb.sleep(5)  # 先给弹窗 5 秒渲染
-
-            # 阶段一：等弹窗出现
-            turnstile_appeared = False
-            for i in range(10):
-                if check_turnstile_present(sb):
-                    turnstile_appeared = True
-                    print(f"  ✅ 第 {i+1} 次检测到 CF 弹窗")
-                    break
-                sb.sleep(1)
-
-            if not turnstile_appeared:
-                print("  ⚠️ 未检测到 CF 弹窗（可能已内联通过或直接成功）")
-
-            # 阶段二：尝试点击并等 token
-            print("⏳ 处理 CF 验证并等待 token 生成（最多 45 秒）…")
-            for i in range(45):
-                # 先尝试点击验证
-                if check_turnstile_present(sb):
-                    try:
-                        sb.uc_gui_click_captcha()
-                    except Exception:
-                        pass
-
-                # 检测 token 是否生成
-                token_len = check_turnstile_token(sb)
-                if token_len > 0:
-                    result["turnstile_passed"] = True
-                    print(f"  ✅ Turnstile token 已生成 | 长度: {token_len}")
-                    break
-
-                sb.sleep(1)
-            else:
-                print("  ⚠️ 45 秒内未获取 Turnstile token")
-
-            if not result["turnstile_passed"] and not turnstile_appeared:
-                # 没弹窗也当成通过（可能站点直接放行了）
-                print("  ℹ️ 未出现 CF 弹窗，视为已通过")
-                result["turnstile_passed"] = True
-
-            # 等签到请求真正发出并完成
-            print("⏳ 等待签到请求完成…")
-            sb.sleep(6)
+            print("⏳ 等待 CF 弹窗渲染（3 秒）…")
+            sb.sleep(3)
 
             # ===========================================================
-            # 5. 读取页面提示（多选择器 + 按钮文字变化）
+            # 6. 无条件调用 uc_gui_click_captcha（处理 CF 弹窗）
+            # ===========================================================
+            print("🔐 尝试处理 CF 验证…")
+            for attempt in range(3):
+                try:
+                    sb.uc_gui_click_captcha()
+                    print(f"  第 {attempt+1} 次 uc_gui_click_captcha 执行")
+                except Exception as e:
+                    print(f"  第 {attempt+1} 次异常: {e}")
+                sb.sleep(3)
+
+            # 检测 Turnstile token（可能已经在某个隐藏 input 里）
+            token_len = sb.execute_script("""
+                (function() {
+                    const inputs = document.querySelectorAll('[name="cf-turnstile-response"]');
+                    let max = 0;
+                    for (let inp of inputs) {
+                        if (inp.value && inp.value.length > max) max = inp.value.length;
+                    }
+                    return max;
+                })()
+            """)
+            print(f"  Turnstile token 长度: {token_len}")
+
+            # ===========================================================
+            # 7. 等签到请求完成（重要：CF 通过后请求才发出）
+            # ===========================================================
+            print("⏳ 等待签到请求完成（15 秒）…")
+            sb.sleep(15)
+
+            # ===========================================================
+            # 8. 读取结果
             # ===========================================================
             print("📢 读取页面提示…")
             toast = sb.execute_script("""
@@ -262,8 +253,8 @@ def browser_checkin():
                         '[class*="toast"]', '[class*="alert"]', '[class*="message"]',
                         '[role="alert"]', '[role="status"]', '[class*="notification"]',
                         '.Toastify__toast', '[class*="Message"]', '[class*="Notice"]',
-                        '[class*="modal"]', '[class*="dialog"]', '[class*="popover"]',
-                        '[data-sonner-toast]', '[data-slot="toast"]'
+                        '[data-sonner-toast]', '[data-slot="toast"]',
+                        '[aria-live="polite"]', '[aria-live="assertive"]'
                     ].join(',');
                     const texts = Array.from(document.querySelectorAll(sels))
                         .map(t => (t.textContent || '').trim())
@@ -274,14 +265,16 @@ def browser_checkin():
             print(f"  页面提示: {toast}")
             result["toast"] = toast
 
-            # 检查按钮文字是否变化（"立即签到" → "已签到" 说明成功）
-            print("🔍 检查按钮状态…")
+            # 检查按钮文字是否变化
+            print("🔍 检查'签到'按钮状态…")
             btn_state = sb.execute_script("""
                 (function() {
-                    const elems = document.querySelectorAll('button, a, [role="button"]');
-                    for (let i = 0; i < elems.length; i++) {
-                        const t = (elems[i].textContent || '').trim();
-                        if (t.includes('签到')) {
+                    const elems = document.querySelectorAll('button');
+                    for (let e of elems) {
+                        const t = (e.textContent || '').trim();
+                        if (t === '立即签到' || t.startsWith('立即签到') ||
+                            t === '已签到' || t.includes('已签到') ||
+                            t.includes('今日已签到')) {
                             return t;
                         }
                     }
@@ -333,30 +326,28 @@ def main():
         send_notification(msg)
         sys.exit(1)
 
-    # 综合判断成功：
-    # 1. 页面提示含"成功/获得/已签到"
-    # 2. 或按钮文字变为"已签到"/"重复签到"
+    # 判断成功：toast 含成功词 或 按钮变为"已签到"
     toast_str = str(r.get("toast", ""))
+    btn_before = str(r.get("button_before", ""))
     btn_after = str(r.get("button_after", ""))
-    combined = toast_str + btn_after
 
-    success = any(k in combined for k in (
-        "成功", "获得", "已签到", "重复", "success", "Success"
-    ))
+    success = (
+        any(k in toast_str for k in ("成功", "获得", "已签到", "重复"))
+        or "已签到" in btn_after
+        or "今日已签到" in btn_after
+    )
 
     if success:
         msg = (f"🎁 iamhc 签到通知\n\n"
                f"✅ 签到成功\n"
                f"📢 页面提示: {toast_str[:200]}\n"
-               f"🖱️ 按钮状态: {btn_after}\n"
-               f"🔒 Turnstile: {'已通过' if r.get('turnstile_passed') else '未确认'}\n"
+               f"🖱️ 按钮: {btn_before} → {btn_after}\n"
                f"⏱️ {now}\n{BASE_URL}")
     else:
         msg = (f"🎁 iamhc 签到通知\n\n"
-               f"⚠️ 已点击签到，但结果未识别\n"
+               f"⚠️ 已点击签到，结果未确认\n"
                f"📢 页面提示: {toast_str[:200]}\n"
-               f"🖱️ 按钮状态: {btn_after}\n"
-               f"🔒 Turnstile: {'已通过' if r.get('turnstile_passed') else '未确认'}\n"
+               f"🖱️ 按钮: {btn_before} → {btn_after}\n"
                f"⏱️ {now}\n{BASE_URL}")
 
     print(msg)
