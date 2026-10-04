@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-iamhc 自动签到脚本（浏览器自动化版）
-通过 SeleniumBase CDP Mode 启动真实浏览器，使用 gui_type 模拟真实键盘输入，
+iamhc 自动签到脚本（浏览器自动化版 - CDP 原生输入修正）
+通过 SeleniumBase CDP Mode 启动真实浏览器，使用 CDP 原生 type 方法输入凭证，
 自动勾选法律同意复选框，通过 Cloudflare Turnstile，完成登录后提取 cookies，
 再调用签到 API。
 """
@@ -50,7 +50,7 @@ def get_cookies_via_browser():
             sb.sleep(5)
 
             # -----------------------------------------------------------
-            # 2. 等待 Turnstile 组件出现（仅检测，不等待通过）
+            # 2. 等待 Turnstile 组件出现（仅检测）
             # -----------------------------------------------------------
             print("⏳ 等待 Turnstile 组件加载…")
             for i in range(30):
@@ -64,20 +64,15 @@ def get_cookies_via_browser():
                 print("⚠️ 未检测到 Turnstile 组件，可能已自动通过或页面结构变化")
 
             # -----------------------------------------------------------
-            # 3. 填写登录凭证（gui_type 真实键盘输入）
+            # 3. 填写登录凭证（CDP 原生输入方法）
             # -----------------------------------------------------------
-            print("✍️ 填写登录凭证（gui_type 真实键盘输入）…")
+            print("✍️ 填写登录凭证（CDP 原生输入）…")
             sb.wait_for_element_visible("input[name='username']", timeout=15)
             sb.wait_for_element_visible("input[name='password']", timeout=15)
 
-            sb.cdp.gui_click_element("input[name='username']")
+            sb.cdp.type("input[name='username']", EMAIL, timeout=1)
             sb.sleep(0.5)
-            sb.cdp.gui_type("input[name='username']", EMAIL)
-            sb.sleep(0.5)
-
-            sb.cdp.gui_click_element("input[name='password']")
-            sb.sleep(0.5)
-            sb.cdp.gui_type("input[name='password']", PASSWORD)
+            sb.cdp.type("input[name='password']", PASSWORD, timeout=1)
             sb.sleep(0.5)
 
             username_val = sb.get_value("input[name='username']")
