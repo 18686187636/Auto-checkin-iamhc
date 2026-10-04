@@ -60,7 +60,6 @@ def get_cookies_via_browser():
             print("⏳ 等待 Turnstile 验证组件…")
             turnstile_found = False
             for i in range(30):
-                # Turnstile 通常在 iframe 中，或页面有 cf-turnstile 容器
                 if sb.is_element_present("iframe[src*='challenges.cloudflare.com']") \
                    or sb.is_element_present("div.cf-turnstile") \
                    or sb.is_element_present("#turnstile-captcha"):
@@ -77,12 +76,10 @@ def get_cookies_via_browser():
             turnstile_passed = False
             for i in range(40):
                 sb.sleep(3)
-                # 常见成功标志：Turnstile iframe 消失、出现成功提示、或页面开始跳转
                 if not sb.is_element_present("iframe[src*='challenges.cloudflare.com']"):
                     turnstile_passed = True
                     print(f"✅ Turnstile 已通过（第 {(i+1)*3} 秒）")
                     break
-                # 尝试主动点击 checkbox（如果可见）
                 try:
                     if sb.is_element_visible("div.cf-turnstile input[type='checkbox']"):
                         sb.cdp.gui_click_element("div.cf-turnstile input[type='checkbox']")
@@ -93,70 +90,37 @@ def get_cookies_via_browser():
             if not turnstile_passed:
                 print("⚠️ Turnstile 等待超时，继续尝试登录…")
 
-            # ---- 填写登录表单 ----
-            print("✍️ 填写登录凭证…")
-            # 尝试多种常见选择器
-            username_selectors = [
-                "input[name='username']",
-                "input[type='email']",
-                "input[placeholder*='邮箱']",
-                "input[placeholder*='用户']",
-                "#username",
-                "#email",
-            ]
-            password_selectors = [
-                "input[name='password']",
-                "input[type='password']",
-                "input[placeholder*='密码']",
-                "#password",
-            ]
+            # ============================================================
+            # 关键修正：在 CDP 模式下，使用 press_keys 而非 type/send_keys
+            # ============================================================
+            print("✍️ 填写登录凭证（CDP press_keys 模式）…")
 
-            filled_user = False
-            for sel in username_selectors:
-                if sb.is_element_present(sel):
-                    sb.cdp.type(sel, EMAIL)
-                    filled_user = True
-                    print(f"  用户名选择器: {sel}")
-                    break
-            if not filled_user:
-                print("❌ 未找到用户名输入框")
-                return None
+            # 等待输入框可见
+            sb.wait_for_element_visible("input[name='username']", timeout=15)
+            sb.wait_for_element_visible("input[name='password']", timeout=15)
 
-            filled_pass = False
-            for sel in password_selectors:
-                if sb.is_element_present(sel):
-                    sb.cdp.type(sel, PASSWORD)
-                    filled_pass = True
-                    print(f"  密码选择器: {sel}")
-                    break
-            if not filled_pass:
-                print("❌ 未找到密码输入框")
+            # 使用 press_keys 以人类速度输入，确保 CDP 模式下生效
+            sb.press_keys("input[name='username']", EMAIL)
+            sb.sleep(1)  # 短暂等待，让前端框架响应输入
+            sb.press_keys("input[name='password']", PASSWORD)
+            sb.sleep(1)
+
+            # 验证输入是否成功
+            username_val = sb.get_value("input[name='username']")
+            password_val = sb.get_value("input[name='password']")
+            print(f"  用户名输入框当前值: '{username_val}'")
+            print(f"  密码输入框当前值: '{'*' * len(password_val) if password_val else ''}'")
+
+            if not username_val or not password_val:
+                print("❌ 输入框内容为空，press_keys 未能写入")
                 return None
+            else:
+                print("✅ 输入框内容已确认写入")
 
             # ---- 点击登录按钮 ----
             print("🖱️ 点击登录按钮…")
-            submit_selectors = [
-                "button[type='submit']",
-                "button:contains('登录')",
-                "button:contains('Login')",
-                "button:contains('Sign in')",
-                "input[type='submit']",
-                ".login-button",
-            ]
-            clicked = False
-            for sel in submit_selectors:
-                try:
-                    if sb.is_element_present(sel):
-                        sb.cdp.click(sel)
-                        clicked = True
-                        print(f"  登录按钮选择器: {sel}")
-                        break
-                except Exception:
-                    pass
-            if not clicked:
-                # 兜底：按 Enter
-                sb.cdp.press_keyboard_key(password_selectors[0] if filled_pass else "body", "Enter")
-                print("  未找到登录按钮，尝试按 Enter 提交")
+            sb.wait_for_element_visible("button[type='submit']", timeout=10)
+            sb.click("button[type='submit']")
 
             # ---- 等待登录成功（URL 变化 / 页面元素出现）----
             print("⏳ 等待登录完成…")
@@ -176,6 +140,7 @@ def get_cookies_via_browser():
 
             if not login_ok:
                 print("⚠️ 登录可能未成功，尝试继续提取 cookies…")
+                sb.save_screenshot("login_failed.png")
 
             # ---- 提取 cookies ----
             print("🍪 提取 cookies…")
@@ -274,7 +239,6 @@ def main():
         print("请设置 EMAIL 和 PASSWORD 环境变量")
         sys.exit(1)
 
-    # 1. 浏览器登录，获取 cookies
     cookies = get_cookies_via_browser()
     if not cookies:
         msg = "❌ iamhc 浏览器登录失败，未能获取 cookies"
@@ -282,12 +246,10 @@ def main():
         send_notification(msg)
         sys.exit(1)
 
-    # 检查关键 cookie
     has_session = any("session" in k.lower() or "token" in k.lower() for k in cookies.keys())
     if not has_session:
         print("⚠️ cookies 中未发现明显的会话标识，仍尝试调用 API…")
 
-    # 2. 用 cookies 调用签到 API
     session = make_api_session(cookies)
 
     info_before = get_user_info(session)
