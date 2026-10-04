@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-iamhc 自动签到脚本（SeleniumBase UC 模式版）
-使用 SeleniumBase UC 模式 + uc_open_with_reconnect 通过 Cloudflare Turnstile，
-提取 cookies 后调用签到 API。
+iamhc 自动签到脚本（UC 模式修正版）
+使用 SeleniumBase UC 模式 + uc_gui_click_captcha 通过 Cloudflare Turnstile，
+调整操作顺序为：填写凭证 → 勾选同意 → 等待 Turnstile → 截图 → 提交。
 """
 
 import os, sys, time, json, requests
@@ -31,7 +31,7 @@ def get_cookies_via_browser():
 
     with SB(
         uc=True,
-        test=True,          # 让 seleniumbase 自动管理 xvfb
+        test=True,
         headed=True,
         incognito=True,
         locale_code="zh-CN",
@@ -39,9 +39,9 @@ def get_cookies_via_browser():
     ) as sb:
         try:
             # ---------------------------------------------------------
-            # 1. 用 uc_open_with_reconnect 打开登录页（绕过 Cloudflare 关键）
+            # 1. 打开登录页
             # ---------------------------------------------------------
-            print(f"🌐 打开登录页（uc_open_with_reconnect）: {LOGIN_URL}")
+            print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
 
@@ -54,20 +54,7 @@ def get_cookies_via_browser():
             print("✅ 登录表单已加载")
 
             # ---------------------------------------------------------
-            # 3. 等待 Turnstile 组件渲染（先等出现）
-            # ---------------------------------------------------------
-            print("⏳ 等待 Turnstile 组件渲染…")
-            for i in range(30):
-                if (sb.is_element_present("iframe[src*='challenges.cloudflare.com']")
-                        or sb.is_element_present("div.cf-turnstile")):
-                    print(f"✅ Turnstile 组件已出现（第 {i+1} 次检查）")
-                    break
-                sb.sleep(1)
-            else:
-                print("⚠️ 未检测到 Turnstile iframe，可能已通过或渲染较慢")
-
-            # ---------------------------------------------------------
-            # 4. 填写登录凭证（UC 模式标准 type，触发 React 事件）
+            # 3. 填写登录凭证（先填，再等 Turnstile）
             # ---------------------------------------------------------
             print("✍️ 填写登录凭证…")
             sb.type("input[name='username']", EMAIL)
@@ -83,7 +70,7 @@ def get_cookies_via_browser():
                 return None
 
             # ---------------------------------------------------------
-            # 5. 勾选法律同意复选框
+            # 4. 勾选法律同意复选框
             # ---------------------------------------------------------
             print("☑️ 勾选法律同意复选框…")
             consent = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
@@ -99,7 +86,33 @@ def get_cookies_via_browser():
                 print(f"⚠️ 勾选复选框异常: {e}")
 
             # ---------------------------------------------------------
-            # 6. 等待 Turnstile token 真正生成（关键！）
+            # 5. 等待 Turnstile 组件加载（先等出现）
+            # ---------------------------------------------------------
+            print("⏳ 等待 Turnstile 组件加载…")
+            # Turnstile 现在位于 Shadow-root 中，无法直接定位 iframe，
+            # 但可以通过等待足够时间确保组件已渲染
+            sb.sleep(5)
+
+            # ---------------------------------------------------------
+            # 6. 使用 uc_gui_click_captcha 自动点击 Turnstile
+            # ---------------------------------------------------------
+            print("🖱️ 尝试自动点击 Turnstile…")
+            try:
+                # uc_gui_click_captcha 会自动检测 CF Turnstile 并点击
+                # 需要确保已等待足够时间让 Turnstile 完成加载
+                sb.uc_gui_click_captcha()
+                print("✅ uc_gui_click_captcha 执行完成")
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_captcha 异常: {e}")
+                # 备用方案：用 CDP 直接点击
+                try:
+                    sb.cdp.gui_click_element("div.cf-turnstile")
+                    print("✅ CDP gui_click_element 执行完成")
+                except Exception as e2:
+                    print(f"⚠️ CDP 点击也失败: {e2}")
+
+            # ---------------------------------------------------------
+            # 7. 等待 Turnstile token 生成
             # ---------------------------------------------------------
             print("⏳ 等待 Turnstile token 生成…")
             token = ""
@@ -108,21 +121,31 @@ def get_cookies_via_browser():
                     'return (document.querySelector(\'[name="cf-turnstile-response"]\') || {}).value || "";'
                 )
                 if token:
-                    print(f"✅ Turnstile token 已生成 | 长度: {len(token)} | 前50字符: {token[:50]}...")
+                    print(f"✅ Turnstile token 已生成 | 长度: {len(token)}")
                     break
                 sb.sleep(1)
             if not token:
                 print("⚠️ 等待 60 秒仍未获取 token，继续尝试提交…")
 
             # ---------------------------------------------------------
-            # 7. 点击登录按钮
+            # 8. 点击登录前截图（排查用）
+            # ---------------------------------------------------------
+            print("📸 点击登录前截图…")
+            try:
+                sb.save_screenshot("before_submit.png")
+                print("  截图已保存: before_submit.png")
+            except Exception as e:
+                print(f"  截图失败: {e}")
+
+            # ---------------------------------------------------------
+            # 9. 点击登录按钮
             # ---------------------------------------------------------
             print("🖱️ 点击登录按钮…")
             sb.wait_for_element_visible("button[type='submit']", timeout=10)
             sb.click("button[type='submit']")
 
             # ---------------------------------------------------------
-            # 8. 等待登录成功（URL 变化）
+            # 10. 等待登录成功
             # ---------------------------------------------------------
             print("⏳ 等待登录完成…")
             login_ok = False
@@ -141,11 +164,26 @@ def get_cookies_via_browser():
                     pass
 
             # ---------------------------------------------------------
-            # 9. 提取 cookies
+            # 11. 提取 cookies（修正：使用 cdp.get_all_cookies 或 execute_cdp_cmd）
             # ---------------------------------------------------------
             print("🍪 提取 cookies…")
-            all_cookies = sb.get_all_cookies()
-            cookies = {c["name"]: c["value"] for c in all_cookies}
+            try:
+                # 方法 1：CDP 模式下的 cookie 方法
+                all_cookies = sb.cdp.get_all_cookies()
+                cookies = {c["name"]: c["value"] for c in all_cookies}
+            except Exception as e:
+                print(f"  cdp.get_all_cookies 失败: {e}，尝试 execute_cdp_cmd…")
+                # 方法 2：使用 execute_cdp_cmd 获取所有 cookies（包括指定 path 的）
+                try:
+                    cdp_cookies = sb.execute_cdp_cmd('Storage.getCookies', {})
+                    cookies = {}
+                    for c in cdp_cookies.get("cookies", []):
+                        if "hcnsec" in c.get("domain", ""):
+                            cookies[c["name"]] = c["value"]
+                except Exception as e2:
+                    print(f"  execute_cdp_cmd 也失败: {e2}")
+                    cookies = {}
+
             print(f"✅ 提取到 {len(cookies)} 个 cookies: {list(cookies.keys())}")
             return cookies
 
