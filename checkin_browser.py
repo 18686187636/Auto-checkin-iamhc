@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-iamhc 自动签到脚本（UC 模式修正版）
-使用 SeleniumBase UC 模式 + uc_gui_click_captcha 通过 Cloudflare Turnstile，
-调整操作顺序为：填写凭证 → 勾选同意 → 等待 Turnstile → 截图 → 提交。
+iamhc 自动签到脚本
+优先使用 COOKIES 环境变量；无效时用浏览器登录（账号密码）兜底。
 """
 
 import os, sys, time, json, requests
 from datetime import datetime, timezone, timedelta
 
+# ---- 环境变量 ----
 EMAIL        = os.environ.get("EMAIL") or ""
 PASSWORD     = os.environ.get("PASSWORD") or ""
+COOKIES      = os.environ.get("COOKIES") or ""          # 手动获取，格式: "k1=v1; k2=v2; ..."
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
@@ -23,184 +24,18 @@ LOGIN_URL  = f"{BASE_URL}/sign-in"
 LOGIN_PATH = "/sign-in"
 
 
-def get_cookies_via_browser():
-    from seleniumbase import SB
-
-    print("🚀 启动 UC 浏览器…")
-    cookies = None
-
-    with SB(
-        uc=True,
-        test=True,
-        headed=True,
-        incognito=True,
-        locale_code="zh-CN",
-        window_size="1920,1080",
-    ) as sb:
-        try:
-            # ---------------------------------------------------------
-            # 1. 打开登录页
-            # ---------------------------------------------------------
-            print(f"🌐 打开登录页: {LOGIN_URL}")
-            sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
-            sb.sleep(3)
-
-            # ---------------------------------------------------------
-            # 2. 等登录表单出现
-            # ---------------------------------------------------------
-            print("⏳ 等待登录表单…")
-            sb.wait_for_element_visible("input[name='username']", timeout=30)
-            sb.wait_for_element_visible("input[name='password']", timeout=10)
-            print("✅ 登录表单已加载")
-
-            # ---------------------------------------------------------
-            # 3. 填写登录凭证（先填，再等 Turnstile）
-            # ---------------------------------------------------------
-            print("✍️ 填写登录凭证…")
-            sb.type("input[name='username']", EMAIL)
-            sb.sleep(0.5)
-            sb.type("input[name='password']", PASSWORD)
-            sb.sleep(0.5)
-
-            u = sb.get_value("input[name='username']")
-            p = sb.get_value("input[name='password']")
-            print(f"  用户名: '{u}'  密码长度: {len(p) if p else 0}")
-            if not u or not p:
-                print("❌ 输入框为空")
-                return None
-
-            # ---------------------------------------------------------
-            # 4. 勾选法律同意复选框
-            # ---------------------------------------------------------
-            print("☑️ 勾选法律同意复选框…")
-            consent = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
-            try:
-                sb.wait_for_element_present(consent, timeout=10)
-                checked = sb.get_attribute(consent, "aria-checked")
-                if checked != "true":
-                    sb.click(consent)
-                    sb.sleep(0.6)
-                    checked = sb.get_attribute(consent, "aria-checked")
-                print(f"  复选框 aria-checked = {checked}")
-            except Exception as e:
-                print(f"⚠️ 勾选复选框异常: {e}")
-
-            # ---------------------------------------------------------
-            # 5. 等待 Turnstile 组件加载（先等出现）
-            # ---------------------------------------------------------
-            print("⏳ 等待 Turnstile 组件加载…")
-            # Turnstile 现在位于 Shadow-root 中，无法直接定位 iframe，
-            # 但可以通过等待足够时间确保组件已渲染
-            sb.sleep(5)
-
-            # ---------------------------------------------------------
-            # 6. 使用 uc_gui_click_captcha 自动点击 Turnstile
-            # ---------------------------------------------------------
-            print("🖱️ 尝试自动点击 Turnstile…")
-            try:
-                # uc_gui_click_captcha 会自动检测 CF Turnstile 并点击
-                # 需要确保已等待足够时间让 Turnstile 完成加载
-                sb.uc_gui_click_captcha()
-                print("✅ uc_gui_click_captcha 执行完成")
-            except Exception as e:
-                print(f"⚠️ uc_gui_click_captcha 异常: {e}")
-                # 备用方案：用 CDP 直接点击
-                try:
-                    sb.cdp.gui_click_element("div.cf-turnstile")
-                    print("✅ CDP gui_click_element 执行完成")
-                except Exception as e2:
-                    print(f"⚠️ CDP 点击也失败: {e2}")
-
-            # ---------------------------------------------------------
-            # 7. 等待 Turnstile token 生成
-            # ---------------------------------------------------------
-            print("⏳ 等待 Turnstile token 生成…")
-            token = ""
-            for i in range(60):
-                token = sb.execute_script(
-                    'return (document.querySelector(\'[name="cf-turnstile-response"]\') || {}).value || "";'
-                )
-                if token:
-                    print(f"✅ Turnstile token 已生成 | 长度: {len(token)}")
-                    break
-                sb.sleep(1)
-            if not token:
-                print("⚠️ 等待 60 秒仍未获取 token，继续尝试提交…")
-
-            # ---------------------------------------------------------
-            # 8. 点击登录前截图（排查用）
-            # ---------------------------------------------------------
-            print("📸 点击登录前截图…")
-            try:
-                sb.save_screenshot("before_submit.png")
-                print("  截图已保存: before_submit.png")
-            except Exception as e:
-                print(f"  截图失败: {e}")
-
-            # ---------------------------------------------------------
-            # 9. 点击登录按钮
-            # ---------------------------------------------------------
-            print("🖱️ 点击登录按钮…")
-            sb.wait_for_element_visible("button[type='submit']", timeout=10)
-            sb.click("button[type='submit']")
-
-            # ---------------------------------------------------------
-            # 10. 等待登录成功
-            # ---------------------------------------------------------
-            print("⏳ 等待登录完成…")
-            login_ok = False
-            for i in range(30):
-                sb.sleep(2)
-                cur = sb.get_current_url()
-                if LOGIN_PATH not in cur:
-                    login_ok = True
-                    print(f"✅ 登录成功，当前 URL: {cur}")
-                    break
-            if not login_ok:
-                print("⚠️ 未检测到 URL 变化，尝试提取 cookies…")
-                try:
-                    sb.save_screenshot("login_failed.png")
-                except Exception:
-                    pass
-
-            # ---------------------------------------------------------
-            # 11. 提取 cookies（修正：使用 cdp.get_all_cookies 或 execute_cdp_cmd）
-            # ---------------------------------------------------------
-            print("🍪 提取 cookies…")
-            try:
-                # 方法 1：CDP 模式下的 cookie 方法
-                all_cookies = sb.cdp.get_all_cookies()
-                cookies = {c["name"]: c["value"] for c in all_cookies}
-            except Exception as e:
-                print(f"  cdp.get_all_cookies 失败: {e}，尝试 execute_cdp_cmd…")
-                # 方法 2：使用 execute_cdp_cmd 获取所有 cookies（包括指定 path 的）
-                try:
-                    cdp_cookies = sb.execute_cdp_cmd('Storage.getCookies', {})
-                    cookies = {}
-                    for c in cdp_cookies.get("cookies", []):
-                        if "hcnsec" in c.get("domain", ""):
-                            cookies[c["name"]] = c["value"]
-                except Exception as e2:
-                    print(f"  execute_cdp_cmd 也失败: {e2}")
-                    cookies = {}
-
-            print(f"✅ 提取到 {len(cookies)} 个 cookies: {list(cookies.keys())}")
-            return cookies
-
-        except Exception as e:
-            print(f"❌ 浏览器自动化异常: {e}")
-            try:
-                sb.save_screenshot("error_screenshot.png")
-            except Exception:
-                pass
-            return None
-
-
 # ===========================================================================
-# 签到逻辑
+# 工具
 # ===========================================================================
-def quota_to_dollar(q): return q / QUOTA_PER_UNIT
-def fmt_usd(v):         return str(round(v))
+def parse_cookie_string(s):
+    """把 "k1=v1; k2=v2" 解析成 dict"""
+    cookies = {}
+    for kv in s.split(";"):
+        kv = kv.strip()
+        if kv and "=" in kv:
+            k, v = kv.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    return cookies
 
 
 def make_api_session(cookies):
@@ -211,7 +46,7 @@ def make_api_session(cookies):
                       "Chrome/154.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Origin": BASE_URL,
-        "Referer": BASE_URL,
+        "Referer": f"{BASE_URL}/console",
     })
     for k, v in cookies.items():
         s.cookies.set(k, v, domain="api.hcnsec.cn")
@@ -223,10 +58,10 @@ def get_user_info(session):
     try:
         d = r.json()
     except ValueError:
-        print(f"用户信息响应非 JSON: {r.status_code} {r.text[:200]}")
+        print(f"  用户信息响应非 JSON: {r.status_code} {r.text[:200]}")
         return None
     if not d.get("success"):
-        print("获取用户信息失败:", d.get("message", ""))
+        print(f"  获取用户信息失败: {d.get('message', '')}")
         return None
     ud = d.get("data") or {}
     if isinstance(ud, dict) and "user" in ud and isinstance(ud["user"], dict):
@@ -242,6 +77,207 @@ def checkin(session):
         return {"success": False, "message": f"签到接口异常 HTTP {r.status_code}"}
 
 
+def quota_to_dollar(q): return q / QUOTA_PER_UNIT
+def fmt_usd(v):         return str(round(v))
+
+
+# ===========================================================================
+# 浏览器登录（兜底方案）
+# ===========================================================================
+def get_cookies_via_browser():
+    """启动真实 Chromium 登录，返回 cookies 字典。失败返回 None。"""
+    from seleniumbase import SB
+
+    print("🚀 启动浏览器（UC 模式）…")
+    cookies = None
+
+    with SB(
+        uc=True,
+        test=True,
+        headed=True,
+        incognito=True,
+        locale_code="zh-CN",
+        window_size="1920,1080",
+    ) as sb:
+        try:
+            # 1. 打开登录页
+            print(f"🌐 打开登录页: {LOGIN_URL}")
+            sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
+            sb.sleep(3)
+
+            # 2. 等表单
+            print("⏳ 等待登录表单…")
+            sb.wait_for_element_visible("input[name='username']", timeout=30)
+            sb.wait_for_element_visible("input[name='password']", timeout=10)
+            print("✅ 登录表单已加载")
+
+            # 3. 填凭证
+            print("✍️ 填写登录凭证…")
+            sb.type("input[name='username']", EMAIL)
+            sb.sleep(0.5)
+            sb.type("input[name='password']", PASSWORD)
+            sb.sleep(0.5)
+
+            u = sb.get_value("input[name='username']")
+            p = sb.get_value("input[name='password']")
+            print(f"  用户名: '{u}'  密码长度: {len(p) if p else 0}")
+
+            # 4. 勾选法律同意
+            print("☑️ 勾选法律同意复选框…")
+            consent = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
+            try:
+                sb.wait_for_element_present(consent, timeout=10)
+                checked = sb.get_attribute(consent, "aria-checked")
+                if checked != "true":
+                    sb.click(consent)
+                    sb.sleep(0.6)
+                    checked = sb.get_attribute(consent, "aria-checked")
+                print(f"  复选框 aria-checked = {checked}")
+            except Exception as e:
+                print(f"⚠️ 勾选复选框异常: {e}")
+
+            # 5. 等待 Turnstile 加载
+            print("⏳ 等待 Turnstile 组件加载…")
+            sb.sleep(5)
+
+            # 6. 自动点击 Turnstile
+            print("🖱️ 尝试自动点击 Turnstile…")
+            try:
+                sb.uc_gui_click_captcha()
+                print("✅ uc_gui_click_captcha 执行完成")
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_captcha 异常: {e}")
+
+            # 7. 等 token 生成
+            print("⏳ 等待 Turnstile token 生成…")
+            token = ""
+            for i in range(60):
+                token = sb.execute_script(
+                    'return (document.querySelector(\'[name="cf-turnstile-response"]\') || {}).value || "";'
+                )
+                if token:
+                    print(f"✅ Turnstile token 已生成 | 长度: {len(token)}")
+                    break
+                sb.sleep(1)
+            if not token:
+                print("⚠️ 等待 60 秒仍未获取 token，继续尝试提交…")
+
+            # 8. 提交
+            print("🖱️ 点击登录按钮…")
+            sb.wait_for_element_visible("button[type='submit']", timeout=10)
+            sb.click("button[type='submit']")
+
+            # 9. 等待跳转
+            print("⏳ 等待登录完成…")
+            login_ok = False
+            for i in range(30):
+                sb.sleep(2)
+                cur = sb.get_current_url()
+                if LOGIN_PATH not in cur:
+                    login_ok = True
+                    print(f"✅ 登录成功，当前 URL: {cur}")
+                    break
+            if not login_ok:
+                print("⚠️ 未检测到 URL 变化")
+                try:
+                    sb.save_screenshot("login_failed.png")
+                except Exception:
+                    pass
+
+            # 10. 多方式提取 cookies
+            print("🍪 提取 cookies…")
+            cookies = {}
+
+            # 方式 1：sb.driver.get_cookies()
+            try:
+                raw = sb.driver.get_cookies()
+                if raw:
+                    cookies = {c["name"]: c["value"] for c in raw}
+                    print(f"  方式1 driver.get_cookies: {len(cookies)} 个")
+            except Exception as e:
+                print(f"  方式1 失败: {e}")
+
+            # 方式 2：sb.get_all_cookies()
+            if not cookies:
+                try:
+                    raw = sb.get_all_cookies()
+                    if raw:
+                        cookies = {c["name"]: c["value"] for c in raw}
+                        print(f"  方式2 get_all_cookies: {len(cookies)} 个")
+                except Exception as e:
+                    print(f"  方式2 失败: {e}")
+
+            # 方式 3：Network.getAllCookies（CDP）
+            if not cookies:
+                try:
+                    raw = sb.execute_cdp_cmd("Network.getAllCookies", {})
+                    clist = raw.get("cookies", [])
+                    if clist:
+                        cookies = {c["name"]: c["value"] for c in clist}
+                        print(f"  方式3 Network.getAllCookies: {len(cookies)} 个")
+                except Exception as e:
+                    print(f"  方式3 失败: {e}")
+
+            # 方式 4：Network.getCookies 只拿当前 URL
+            if not cookies:
+                try:
+                    raw = sb.execute_cdp_cmd("Network.getCookies", {"urls": [BASE_URL]})
+                    clist = raw.get("cookies", [])
+                    if clist:
+                        cookies = {c["name"]: c["value"] for c in clist}
+                        print(f"  方式4 Network.getCookies: {len(cookies)} 个")
+                except Exception as e:
+                    print(f"  方式4 失败: {e}")
+
+            # 方式 5：document.cookie（只能拿非 HttpOnly 的）
+            if not cookies:
+                try:
+                    raw = sb.execute_script("return document.cookie")
+                    if raw:
+                        for kv in raw.split(";"):
+                            kv = kv.strip()
+                            if "=" in kv:
+                                k, v = kv.split("=", 1)
+                                cookies[k.strip()] = v.strip()
+                        print(f"  方式5 document.cookie: {len(cookies)} 个")
+                except Exception as e:
+                    print(f"  方式5 失败: {e}")
+
+            # 方式 6：Network.getCookies 拿 login 页面域下的所有 cookie
+            if not cookies:
+                try:
+                    raw = sb.execute_cdp_cmd("Network.getCookies", {"urls": [LOGIN_URL, BASE_URL]})
+                    clist = raw.get("cookies", [])
+                    if clist:
+                        cookies = {c["name"]: c["value"] for c in clist}
+                        print(f"  方式6 Network.getCookies(login): {len(cookies)} 个")
+                except Exception as e:
+                    print(f"  方式6 失败: {e}")
+
+            if cookies:
+                # 打印成一行，方便复制到 GitHub Secrets
+                cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+                print("\n" + "=" * 60)
+                print("📋 请把以下内容复制到 GitHub Secrets 的 COOKIES 变量：")
+                print("=" * 60)
+                print(cookie_str)
+                print("=" * 60 + "\n")
+
+            print(f"✅ 最终提取到 {len(cookies)} 个 cookies: {list(cookies.keys())}")
+            return cookies if cookies else None
+
+        except Exception as e:
+            print(f"❌ 浏览器自动化异常: {e}")
+            try:
+                sb.save_screenshot("error_screenshot.png")
+            except Exception:
+                pass
+            return None
+
+
+# ===========================================================================
+# 通知
+# ===========================================================================
 def send_notification(message):
     print("\n" + "=" * 30)
     print(message)
@@ -256,26 +292,48 @@ def send_notification(message):
             print("Telegram 异常:", e)
 
 
+# ===========================================================================
+# 主流程
+# ===========================================================================
 def main():
-    if not EMAIL or not PASSWORD:
-        print("请设置 EMAIL 和 PASSWORD")
-        sys.exit(1)
+    session = None
 
-    cookies = get_cookies_via_browser()
-    if not cookies:
-        msg = "❌ iamhc 浏览器登录失败，未获取到 cookies"
-        print(msg)
-        send_notification(msg)
-        sys.exit(1)
+    # ---------- 路径 1：优先用 COOKIES 环境变量 ----------
+    if COOKIES:
+        print("🔑 使用环境变量 COOKIES 构造会话…")
+        cookie_dict = parse_cookie_string(COOKIES)
+        print(f"  解析到 {len(cookie_dict)} 个 cookie: {list(cookie_dict.keys())}")
+        session = make_api_session(cookie_dict)
+        info = get_user_info(session)
+        if info:
+            print(f"✅ COOKIES 有效 | 用户: {info.get('username', '')}")
+        else:
+            print("⚠️ COOKIES 已失效，将回退到浏览器登录")
+            session = None
+    else:
+        print("ℹ️ 未配置 COOKIES 环境变量")
 
-    session = make_api_session(cookies)
-    info = get_user_info(session)
-    if not info:
-        msg = "⚠️ iamhc cookies 无效"
-        print(msg)
-        send_notification(msg)
-        sys.exit(1)
+    # ---------- 路径 2：浏览器登录兜底 ----------
+    if session is None:
+        if not EMAIL or not PASSWORD:
+            print("❌ 无法回退：未配置 EMAIL 和 PASSWORD")
+            sys.exit(1)
+        print("🌐 回退到浏览器登录…")
+        cookies = get_cookies_via_browser()
+        if not cookies:
+            msg = "❌ iamhc 浏览器登录失败，未获取到 cookies"
+            print(msg)
+            send_notification(msg)
+            sys.exit(1)
+        session = make_api_session(cookies)
+        info = get_user_info(session)
+        if not info:
+            msg = "❌ iamhc 浏览器登录成功但 cookies 无效"
+            print(msg)
+            send_notification(msg)
+            sys.exit(1)
 
+    # ---------- 签到 ----------
     uid      = info.get("id") or info.get("user_id")
     username = info.get("username", str(uid))
     bal_before = quota_to_dollar(info.get("quota", 0))
