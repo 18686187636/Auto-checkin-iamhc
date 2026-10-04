@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-iamhc 纯浏览器自动签到 v8
-- 若按钮是"立即签到" → 点击 → 处理 CF → 读取奖励
-- 若按钮已是"已签到" → 直接读奖励，无需点击
-"""
+
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -41,13 +37,23 @@ def send_notification(message):
 
 
 # ===========================================================================
-# 读取奖励金额（独立函数，多处复用）
+# 精确读取奖励金额（修正版）
 # ===========================================================================
 def read_award_amount(sb):
-    """读取页面上的'今天 +¥XX.XX'，返回 (award_text, award_amount)"""
+    """精确读取页面上的'今天 +¥XX.XX'，优先匹配特定的 <p> 标签"""
     award_text = sb.execute_script("""
         (function() {
-            // 方式1：精确 class 匹配
+            // 优先精确匹配用户提供的 <p> 结构
+            const precise = document.querySelector(
+                'p.text-muted-foreground.mt-1.line-clamp-2, p[class*="line-clamp-2"][class*="text-muted-foreground"]'
+            );
+            if (precise) {
+                const t = (precise.textContent || '').trim();
+                if (t.includes('今天') && t.includes('¥')) {
+                    return t;
+                }
+            }
+            // 备选：更宽泛的 class 匹配
             const candidates = document.querySelectorAll(
                 'p.text-muted-foreground, p[class*="text-muted-foreground"], [class*="line-clamp-2"]'
             );
@@ -57,7 +63,7 @@ def read_award_amount(sb):
                     return t;
                 }
             }
-            // 方式2：全页扫描"今天 +¥XX.XX"格式的叶子节点
+            // 最后备选：全页扫描叶子节点
             const all = document.querySelectorAll('p, span, div');
             for (let el of all) {
                 if (el.children.length > 0) continue;
@@ -84,7 +90,7 @@ def browser_checkin():
 
     result = {
         "logged_in": False,
-        "already_done": False,     # 今天已签到
+        "already_done": False,
         "checkin_clicked": False,
         "button_before": "",
         "button_after": "",
@@ -105,9 +111,9 @@ def browser_checkin():
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
     ) as sb:
         try:
-            # ===========================================================
+            # -----------------------------------------------------------
             # 1. 登录
-            # ===========================================================
+            # -----------------------------------------------------------
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
@@ -168,9 +174,9 @@ def browser_checkin():
 
             sb.sleep(3)
 
-            # ===========================================================
+            # -----------------------------------------------------------
             # 2. 打开个人资料页
-            # ===========================================================
+            # -----------------------------------------------------------
             print("📄 打开个人资料页面…")
             sb.open(PROFILE_URL)
             sb.sleep(4)
@@ -180,15 +186,15 @@ def browser_checkin():
                 result["error"] = "登录状态失效"
                 return result
 
-            # ===========================================================
+            # -----------------------------------------------------------
             # 3. 检测按钮当前状态
-            # ===========================================================
+            # -----------------------------------------------------------
             print("🔍 检测签到按钮状态…")
             btn_info = sb.execute_script("""
                 (function() {
                     const elems = document.querySelectorAll('button');
-                    let immediate = null;   // "立即签到"
-                    let done = null;         // "已签到"（可能文字更长）
+                    let immediate = null;
+                    let done = null;
                     for (let e of elems) {
                         const t = (e.textContent || '').trim();
                         if (t === '立即签到' || t.startsWith('立即签到')) {
@@ -201,18 +207,11 @@ def browser_checkin():
                     }
                     if (immediate) {
                         immediate.el.setAttribute('data-checkin-target', '1');
-                        return JSON.stringify({
-                            state: 'ready',
-                            text: immediate.text
-                        });
+                        return JSON.stringify({state: 'ready', text: immediate.text});
                     }
                     if (done) {
-                        return JSON.stringify({
-                            state: 'already',
-                            text: done.text
-                        });
+                        return JSON.stringify({state: 'already', text: done.text});
                     }
-                    // 都没找到，返回所有按钮文字便于排查
                     return JSON.stringify({
                         state: 'not_found',
                         all_buttons: Array.from(elems)
@@ -231,16 +230,15 @@ def browser_checkin():
             state = info.get("state", "not_found")
             result["button_before"] = info.get("text", "")
 
-            # ===========================================================
-            # 4. 已签到 → 直接读金额，跳过点击
-            # ===========================================================
+            # -----------------------------------------------------------
+            # 4. 已签到 → 直接读金额
+            # -----------------------------------------------------------
             if state == "already":
                 print(f"✅ 今日已签到 | 按钮: '{info.get('text')}'")
                 result["already_done"] = True
-                result["checkin_clicked"] = True  # 视为已处理
+                result["checkin_clicked"] = True
                 result["button_after"] = info.get("text", "")
 
-                # 读取金额
                 award_text, award_amount = read_award_amount(sb)
                 result["award_text"] = award_text
                 result["award_amount"] = award_amount
@@ -252,9 +250,9 @@ def browser_checkin():
                     pass
                 return result
 
-            # ===========================================================
-            # 5. 未找到任何签到相关按钮
-            # ===========================================================
+            # -----------------------------------------------------------
+            # 5. 未找到按钮
+            # -----------------------------------------------------------
             if state == "not_found":
                 print(f"⚠️ 未找到签到按钮")
                 print(f"  所有按钮: {info.get('all_buttons')}")
@@ -262,15 +260,14 @@ def browser_checkin():
                 sb.save_screenshot("no_checkin_button.png")
                 return result
 
-            # ===========================================================
+            # -----------------------------------------------------------
             # 6. 按钮是"立即签到" → 执行签到
-            # ===========================================================
+            # -----------------------------------------------------------
             print(f"  ✅ 找到'立即签到'按钮，开始签到…")
             sb.uc_click("[data-checkin-target='1']", reconnect_time=2)
             result["checkin_clicked"] = True
             print("✅ 已点击")
 
-            # 等 CF 弹窗
             print("⏳ 等待 CF 弹窗渲染（3 秒）…")
             sb.sleep(3)
 
@@ -282,13 +279,12 @@ def browser_checkin():
                     pass
                 sb.sleep(3)
 
-            # 等签到请求完成
             print("⏳ 等待签到请求完成（15 秒）…")
             sb.sleep(15)
 
-            # ===========================================================
+            # -----------------------------------------------------------
             # 7. 读取金额 + 按钮状态
-            # ===========================================================
+            # -----------------------------------------------------------
             print("💰 读取签到奖励金额…")
             award_text, award_amount = read_award_amount(sb)
             result["award_text"] = award_text
@@ -357,7 +353,6 @@ def main():
     amount = r.get("award_amount", "")
     award_text = r.get("award_text", "")
 
-    # 金额行
     if amount:
         amount_line = f"💰 本次奖励: +¥{amount}\n"
     elif award_text:
@@ -365,7 +360,6 @@ def main():
     else:
         amount_line = ""
 
-    # 判定成功
     success = already or ("已签到" in btn_after)
 
     if success:
