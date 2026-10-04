@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
+"""
+iamhc 纯浏览器自动签到 v11
+- 金额提取带完整诊断输出，打印所有 '今天 +¥' 候选元素
+- 优先根据卡片标题（"每日签到"）定位正确的金额
+"""
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -34,47 +38,65 @@ def send_notification(message):
 
 
 def read_award_amount(sb):
-    """读取"每日签到"卡片内的今日奖励金额"""
-    award_text = sb.execute_script("""
+    """读取“每日签到”卡片内的今日奖励金额，并打印所有候选元素用于诊断"""
+    debug_info = sb.execute_script("""
         (function() {
-            // 1. 找到"每日签到"标题
-            const h3s = document.querySelectorAll('h3');
-            let card = null;
-            for (let h of h3s) {
-                if ((h.textContent || '').trim() === '每日签到') {
-                    card = h.closest('button') || h.closest('div[class*="border"]') || h.parentElement;
-                    if (card && !card.querySelector('p')) {
-                        card = card.parentElement;
-                    }
-                    break;
-                }
-            }
-            // 2. 在卡片内找"今天 +¥XX.XX"
-            if (card) {
-                const ps = card.querySelectorAll('p');
-                for (let p of ps) {
-                    const t = (p.textContent || '').trim();
-                    if (t.includes('今天') && t.includes('¥')) {
-                        return t;
-                    }
-                }
-            }
-            // 3. 兜底：找带 line-clamp-2 的 <p>
-            const precise = document.querySelectorAll('p.line-clamp-2, p[class*="line-clamp-2"]');
-            for (let p of precise) {
+            const results = [];
+            document.querySelectorAll('p').forEach(function(p) {
                 const t = (p.textContent || '').trim();
                 if (t.includes('今天') && t.includes('¥')) {
-                    return t;
+                    let parent = p.parentElement;
+                    let cardTitle = '';
+                    let depth = 0;
+                    while (parent && depth < 6) {
+                        const h = parent.querySelector('h3');
+                        if (h) { cardTitle = h.textContent.trim(); break; }
+                        parent = parent.parentElement;
+                        depth++;
+                    }
+                    results.push({
+                        tag: p.tagName,
+                        cls: p.className || '',
+                        text: t,
+                        cardTitle: cardTitle
+                    });
                 }
-            }
-            return '';
+            });
+            return JSON.stringify(results);
         })()
     """)
+    
+    print(f"    🔍 诊断：页面所有 '今天 +¥' 元素")
+    try:
+        candidates = json.loads(debug_info) if debug_info else []
+    except Exception:
+        candidates = []
+    
+    if not candidates:
+        print("      ⚠️ 未找到任何 '今天 +¥' 元素")
+    for i, c in enumerate(candidates):
+        print(f"      [{i}] <{c['tag']}> class='{c['cls'][:80]}...' "
+              f"card='{c['cardTitle']}' text='{c['text']}'")
+    
+    award_text = ""
+    for c in candidates:
+        if c.get("cardTitle") == "每日签到":
+            award_text = c["text"]
+            break
+    if not award_text:
+        for c in candidates:
+            if "line-clamp-2" in c.get("cls", "") and "text-muted-foreground" in c.get("cls", ""):
+                award_text = c["text"]
+                break
+    if not award_text and candidates:
+        award_text = candidates[0]["text"]
+    
     amount = ""
     m = re.search(r'[+＋]\s*¥\s*([\d.]+)', award_text or "")
     if m:
         amount = m.group(1)
-    return award_text or "", amount
+    
+    return award_text, amount
 
 
 def browser_checkin():
