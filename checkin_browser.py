@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-iamhc 自动签到脚本（浏览器自动化版）
-通过 SeleniumBase CDP Mode 启动真实浏览器，自动通过 Cloudflare Turnstile，
-完成登录后提取 cookies，再调用签到 API。
+iamhc 自动签到脚本（浏览器自动化版 - PyAutoGUI 修正版）
+通过 SeleniumBase CDP Mode 启动真实浏览器，使用 PyAutoGUI 模拟真实键盘输入，
+自动通过 Cloudflare Turnstile，完成登录后提取 cookies，再调用签到 API。
 """
 
 import os, sys, time, json, requests
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
+import pyautogui
 
 # ---- 环境变量 ----
 EMAIL        = os.environ.get("EMAIL") or ""
@@ -21,27 +22,18 @@ BASE_URL = "https://api.hcnsec.cn"
 QUOTA_PER_UNIT = 500000
 TZ_CN = timezone(timedelta(hours=8))
 
-# ---- 浏览器自动化配置 ----
 LOGIN_URL   = f"{BASE_URL}/sign-in"
-LOGIN_PATH  = "/sign-in"          # 登录成功后 URL 不再包含此路径即视为成功
-MAX_WAIT_S  = 120                 # Turnstile + 登录总超时（秒）
+LOGIN_PATH  = "/sign-in"
+MAX_WAIT_S  = 120
 
 
-# ===========================================================================
-# 浏览器自动化：通过 Turnstile 并登录，提取 cookies
-# ===========================================================================
 def get_cookies_via_browser():
-    """
-    启动真实 Chromium，访问登录页，等待 Turnstile 自动通过，
-    填写账号密码登录，返回 cookies 字典。失败返回 None。
-    """
+    """启动真实 Chromium，使用 PyAutoGUI 输入凭证，提取 cookies"""
     from seleniumbase import SB
 
     print("🚀 启动浏览器（SeleniumBase CDP Mode）…")
-
     cookies = None
 
-    # uc=True 启用未检测模式；headed=True + xvfb=True 在无显示器环境中模拟有头浏览器
     with SB(
         uc=True,
         headed=True,
@@ -54,9 +46,9 @@ def get_cookies_via_browser():
         try:
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.activate_cdp_mode(LOGIN_URL)
-            sb.sleep(5)  # 等待页面初步加载
+            sb.sleep(5)
 
-            # ---- 等待 Turnstile 组件出现（最多 60 秒）----
+            # ---- 等待 Turnstile 组件出现 ----
             print("⏳ 等待 Turnstile 验证组件…")
             turnstile_found = False
             for i in range(30):
@@ -71,7 +63,7 @@ def get_cookies_via_browser():
             if not turnstile_found:
                 print("⚠️ 未检测到 Turnstile 组件，可能已自动通过或页面结构变化")
 
-            # ---- 等待 Turnstile 自动完成（或手动点击）----
+            # ---- 等待 Turnstile 自动完成 ----
             print("⏳ 等待 Turnstile 验证自动通过…")
             turnstile_passed = False
             for i in range(40):
@@ -91,38 +83,51 @@ def get_cookies_via_browser():
                 print("⚠️ Turnstile 等待超时，继续尝试登录…")
 
             # ============================================================
-            # 关键修正：在 CDP 模式下，使用 press_keys 而非 type/send_keys
+            # 关键修正：使用 PyAutoGUI 模拟真实键盘输入
             # ============================================================
-            print("✍️ 填写登录凭证（CDP press_keys 模式）…")
+            print("✍️ 填写登录凭证（PyAutoGUI 真实键盘输入）…")
 
-            # 等待输入框可见
             sb.wait_for_element_visible("input[name='username']", timeout=15)
             sb.wait_for_element_visible("input[name='password']", timeout=15)
 
-            # 使用 press_keys 以人类速度输入，确保 CDP 模式下生效
-            sb.press_keys("input[name='username']", EMAIL)
-            sb.sleep(1)  # 短暂等待，让前端框架响应输入
-            sb.press_keys("input[name='password']", PASSWORD)
+            # ---- 输入用户名 ----
+            sb.cdp.gui_click_element("input[name='username']")
+            sb.sleep(0.5)
+            pyautogui.hotkey('ctrl', 'a')
+            sb.sleep(0.2)
+            pyautogui.press('delete')
+            sb.sleep(0.2)
+            pyautogui.write(EMAIL, interval=0.05)
             sb.sleep(1)
 
-            # 验证输入是否成功
             username_val = sb.get_value("input[name='username']")
+            print(f"  用户名输入框值: '{username_val}'")
+
+            # ---- 输入密码 ----
+            sb.cdp.gui_click_element("input[name='password']")
+            sb.sleep(0.5)
+            pyautogui.hotkey('ctrl', 'a')
+            sb.sleep(0.2)
+            pyautogui.press('delete')
+            sb.sleep(0.2)
+            pyautogui.write(PASSWORD, interval=0.05)
+            sb.sleep(1)
+
             password_val = sb.get_value("input[name='password']")
-            print(f"  用户名输入框当前值: '{username_val}'")
-            print(f"  密码输入框当前值: '{'*' * len(password_val) if password_val else ''}'")
+            print(f"  密码输入框值: '{'*' * len(password_val) if password_val else ''}'")
 
             if not username_val or not password_val:
-                print("❌ 输入框内容为空，press_keys 未能写入")
+                print("❌ 输入框内容为空，PyAutoGUI 未能写入")
                 return None
             else:
-                print("✅ 输入框内容已确认写入")
+                print("✅ 输入框内容已确认写入（PyAutoGUI）")
 
             # ---- 点击登录按钮 ----
             print("🖱️ 点击登录按钮…")
             sb.wait_for_element_visible("button[type='submit']", timeout=10)
             sb.click("button[type='submit']")
 
-            # ---- 等待登录成功（URL 变化 / 页面元素出现）----
+            # ---- 等待登录成功 ----
             print("⏳ 等待登录完成…")
             login_ok = False
             for i in range(40):
@@ -132,7 +137,6 @@ def get_cookies_via_browser():
                     login_ok = True
                     print(f"✅ 登录成功，当前 URL: {current_url}")
                     break
-                # 检查是否有错误提示
                 if sb.is_element_present(".error, .alert-danger, [class*='error']"):
                     err_text = sb.get_text(".error, .alert-danger, [class*='error']")
                     if err_text and len(err_text) < 200:
@@ -145,10 +149,7 @@ def get_cookies_via_browser():
             # ---- 提取 cookies ----
             print("🍪 提取 cookies…")
             all_cookies = sb.get_all_cookies()
-            cookies = {}
-            for c in all_cookies:
-                cookies[c["name"]] = c["value"]
-
+            cookies = {c["name"]: c["value"] for c in all_cookies}
             print(f"✅ 提取到 {len(cookies)} 个 cookies: {list(cookies.keys())}")
             return cookies
 
@@ -163,7 +164,7 @@ def get_cookies_via_browser():
 
 
 # ===========================================================================
-# 签到逻辑（使用 cookies 调用 API）
+# 签到逻辑（使用 cookies 调用 API）—— 保持不变
 # ===========================================================================
 def quota_to_dollar(quota):
     return quota / QUOTA_PER_UNIT
@@ -174,7 +175,6 @@ def fmt_usd(v):
 
 
 def make_api_session(cookies):
-    """用浏览器提取的 cookies 创建 requests.Session"""
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
