@@ -40,7 +40,6 @@ jobs:
       - name: Install Python deps
         run: |
           pip install --upgrade pip
-          # 使用清华镜像 + 增加重试次数，避免大包下载中断
           pip install --retries 5 --timeout 60 \
             -i https://pypi.tuna.tsinghua.edu.cn/simple \
             seleniumbase requests
@@ -52,7 +51,10 @@ jobs:
           COOKIES:      ${{ secrets.COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-        run: python checkin_browser.py
+        run: |
+          pkill -f chrome || true
+          sleep 2
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python checkin_browser.py
 
       - name: Upload debug artifacts
         if: always()
