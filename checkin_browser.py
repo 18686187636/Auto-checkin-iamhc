@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-iamhc 自动签到脚本（浏览器自动化版 - React 修正版）
-通过 SeleniumBase CDP Mode 启动真实浏览器，使用 JavaScript 设置 React 输入框状态，
-自动勾选法律同意复选框，通过 Cloudflare Turnstile，完成登录后提取 cookies，
-再调用签到 API。
+iamhc 自动签到脚本（浏览器自动化版）
+通过 SeleniumBase CDP Mode 启动真实浏览器，自动通过 Cloudflare Turnstile，
+勾选法律同意复选框，完成登录后提取 cookies，再调用签到 API。
 """
 
 import os, sys, time, json, requests
@@ -25,9 +24,6 @@ LOGIN_URL   = f"{BASE_URL}/sign-in"
 LOGIN_PATH  = "/sign-in"
 
 
-# ===========================================================================
-# 浏览器自动化：通过 Turnstile + 勾选同意 + 登录，提取 cookies
-# ===========================================================================
 def get_cookies_via_browser():
     """启动真实 Chromium，完成登录，返回 cookies 字典。失败返回 None。"""
     from seleniumbase import SB
@@ -45,12 +41,15 @@ def get_cookies_via_browser():
         window_size="1920,1080",
     ) as sb:
         try:
+            # -----------------------------------------------------------
+            # 1. 打开登录页
+            # -----------------------------------------------------------
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.activate_cdp_mode(LOGIN_URL)
             sb.sleep(5)
 
             # -----------------------------------------------------------
-            # 1. 等待 Turnstile 组件出现
+            # 2. 等待 Turnstile 组件出现
             # -----------------------------------------------------------
             print("⏳ 等待 Turnstile 验证组件…")
             turnstile_found = False
@@ -66,7 +65,7 @@ def get_cookies_via_browser():
                 print("⚠️ 未检测到 Turnstile 组件，可能已自动通过或页面结构变化")
 
             # -----------------------------------------------------------
-            # 2. 等待 Turnstile 自动通过
+            # 3. 等待 Turnstile 自动通过
             # -----------------------------------------------------------
             print("⏳ 等待 Turnstile 验证自动通过…")
             turnstile_passed = False
@@ -86,7 +85,7 @@ def get_cookies_via_browser():
                 print("⚠️ Turnstile 等待超时，继续尝试登录…")
 
             # -----------------------------------------------------------
-            # 3. 填写登录凭证（JavaScript 设置 React 状态）
+            # 4. 填写登录凭证（JavaScript 设置 React 状态）
             # -----------------------------------------------------------
             print("✍️ 填写登录凭证（JavaScript 设置 React 状态）…")
             sb.wait_for_element_visible("input[name='username']", timeout=15)
@@ -118,7 +117,7 @@ def get_cookies_via_browser():
             print("✅ 输入框内容已确认写入")
 
             # -----------------------------------------------------------
-            # 4. 勾选法律同意复选框（Base UI 自定义组件）
+            # 5. 勾选法律同意复选框（Base UI 自定义组件）
             # -----------------------------------------------------------
             print("☑️ 勾选法律同意复选框…")
             consent_selector = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
@@ -129,7 +128,6 @@ def get_cookies_via_browser():
                 print(f"  当前 aria-checked = {aria_checked}")
 
                 if aria_checked != "true":
-                    # 方式 1：CDP 真实鼠标点击
                     try:
                         sb.cdp.gui_click_element(consent_selector)
                         sb.sleep(0.6)
@@ -138,7 +136,6 @@ def get_cookies_via_browser():
                     aria_checked = sb.get_attribute(consent_selector, "aria-checked")
                     print(f"  gui_click 后 aria-checked = {aria_checked}")
 
-                    # 方式 2：JS 派发 PointerEvent + MouseEvent
                     if aria_checked != "true":
                         print("  gui_click 未生效，尝试 JS 派发 PointerEvent + MouseEvent…")
                         sb.execute_script(f"""
@@ -163,7 +160,6 @@ def get_cookies_via_browser():
                         print("✅ 法律同意复选框已勾选")
                     else:
                         print("⚠️ 复选框仍未勾选，尝试点击 label 文本…")
-                        # 方式 3：点击 label 元素（有些组件只响应 label 的点击）
                         try:
                             sb.cdp.gui_click_element("#legal-consent-label")
                             sb.sleep(0.6)
@@ -177,14 +173,14 @@ def get_cookies_via_browser():
                 print(f"⚠️ 勾选复选框异常: {e}")
 
             # -----------------------------------------------------------
-            # 5. 点击登录按钮
+            # 6. 点击登录按钮
             # -----------------------------------------------------------
             print("🖱️ 点击登录按钮…")
             sb.wait_for_element_visible("button[type='submit']", timeout=10)
             sb.click("button[type='submit']")
 
             # -----------------------------------------------------------
-            # 6. 等待登录成功
+            # 7. 等待登录成功
             # -----------------------------------------------------------
             print("⏳ 等待登录完成…")
             login_ok = False
@@ -211,7 +207,7 @@ def get_cookies_via_browser():
                     pass
 
             # -----------------------------------------------------------
-            # 7. 提取 cookies
+            # 8. 提取 cookies
             # -----------------------------------------------------------
             print("🍪 提取 cookies…")
             all_cookies = sb.get_all_cookies()
@@ -241,7 +237,6 @@ def fmt_usd(v):
 
 
 def make_api_session(cookies):
-    """用浏览器提取的 cookies 创建 requests.Session"""
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -308,7 +303,6 @@ def main():
         print("请设置 EMAIL 和 PASSWORD 环境变量")
         sys.exit(1)
 
-    # 1. 浏览器登录，获取 cookies
     cookies = get_cookies_via_browser()
     if not cookies:
         msg = "❌ iamhc 浏览器登录失败，未能获取 cookies"
@@ -320,7 +314,6 @@ def main():
     if not has_session:
         print("⚠️ cookies 中未发现明显的会话标识，仍尝试调用 API…")
 
-    # 2. 用 cookies 调用签到 API
     session = make_api_session(cookies)
 
     info_before = get_user_info(session)
