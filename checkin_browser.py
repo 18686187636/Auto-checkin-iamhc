@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+iamhc 纯浏览器自动签到 v8
+- 若按钮是"立即签到" → 点击 → 处理 CF → 读取奖励
+- 若按钮已是"已签到" → 直接读奖励，无需点击
+"""
+
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
 
@@ -35,6 +41,42 @@ def send_notification(message):
 
 
 # ===========================================================================
+# 读取奖励金额（独立函数，多处复用）
+# ===========================================================================
+def read_award_amount(sb):
+    """读取页面上的'今天 +¥XX.XX'，返回 (award_text, award_amount)"""
+    award_text = sb.execute_script("""
+        (function() {
+            // 方式1：精确 class 匹配
+            const candidates = document.querySelectorAll(
+                'p.text-muted-foreground, p[class*="text-muted-foreground"], [class*="line-clamp-2"]'
+            );
+            for (let el of candidates) {
+                const t = (el.textContent || '').trim();
+                if (t.includes('今天') && t.includes('¥')) {
+                    return t;
+                }
+            }
+            // 方式2：全页扫描"今天 +¥XX.XX"格式的叶子节点
+            const all = document.querySelectorAll('p, span, div');
+            for (let el of all) {
+                if (el.children.length > 0) continue;
+                const t = (el.textContent || '').trim();
+                if (t.length < 30 && /今天\\s*\\+\\s*¥/.test(t)) {
+                    return t;
+                }
+            }
+            return '';
+        })()
+    """)
+    amount = ""
+    m = re.search(r'[+＋]\s*¥\s*([\d.]+)', award_text or "")
+    if m:
+        amount = m.group(1)
+    return award_text or "", amount
+
+
+# ===========================================================================
 # 浏览器流程
 # ===========================================================================
 def browser_checkin():
@@ -42,12 +84,13 @@ def browser_checkin():
 
     result = {
         "logged_in": False,
+        "already_done": False,     # 今天已签到
         "checkin_clicked": False,
         "button_before": "",
         "button_after": "",
         "toast": "",
-        "award_text": "",     # 精确的"今天 +¥XX.XX"
-        "award_amount": "",   # 只提取金额数字
+        "award_text": "",
+        "award_amount": "",
         "error": "",
     }
 
@@ -138,60 +181,96 @@ def browser_checkin():
                 return result
 
             # ===========================================================
-            # 3. 精确匹配"立即签到"按钮
+            # 3. 检测按钮当前状态
             # ===========================================================
-            print("🔍 查找'立即签到'按钮…")
+            print("🔍 检测签到按钮状态…")
             btn_info = sb.execute_script("""
                 (function() {
                     const elems = document.querySelectorAll('button');
-                    let found = null;
+                    let immediate = null;   // "立即签到"
+                    let done = null;         // "已签到"（可能文字更长）
                     for (let e of elems) {
                         const t = (e.textContent || '').trim();
-                        if (t === '立即签到') { found = e; break; }
-                    }
-                    if (!found) {
-                        for (let e of elems) {
-                            const t = (e.textContent || '').trim();
-                            if (t.startsWith('立即签到')) { found = e; break; }
+                        if (t === '立即签到' || t.startsWith('立即签到')) {
+                            immediate = {el: e, text: t};
+                            break;
+                        }
+                        if (t.includes('已签到') && !done) {
+                            done = {el: e, text: t};
                         }
                     }
-                    if (found) {
-                        found.setAttribute('data-checkin-target', '1');
+                    if (immediate) {
+                        immediate.el.setAttribute('data-checkin-target', '1');
                         return JSON.stringify({
-                            ok: true,
-                            text: (found.textContent || '').trim()
+                            state: 'ready',
+                            text: immediate.text
                         });
                     }
-                    return JSON.stringify({ok: false});
+                    if (done) {
+                        return JSON.stringify({
+                            state: 'already',
+                            text: done.text
+                        });
+                    }
+                    // 都没找到，返回所有按钮文字便于排查
+                    return JSON.stringify({
+                        state: 'not_found',
+                        all_buttons: Array.from(elems)
+                            .map(e => (e.textContent || '').trim())
+                            .filter(t => t && t.length < 50)
+                    });
                 })()
             """)
-            print(f"  按钮查找结果: {btn_info}")
+            print(f"  按钮状态: {btn_info}")
 
             try:
                 info = json.loads(btn_info)
             except Exception:
-                info = {"ok": False}
+                info = {"state": "not_found"}
 
-            if not info.get("ok"):
-                print("⚠️ 未找到'立即签到'按钮")
-                result["error"] = "未找到立即签到按钮"
+            state = info.get("state", "not_found")
+            result["button_before"] = info.get("text", "")
+
+            # ===========================================================
+            # 4. 已签到 → 直接读金额，跳过点击
+            # ===========================================================
+            if state == "already":
+                print(f"✅ 今日已签到 | 按钮: '{info.get('text')}'")
+                result["already_done"] = True
+                result["checkin_clicked"] = True  # 视为已处理
+                result["button_after"] = info.get("text", "")
+
+                # 读取金额
+                award_text, award_amount = read_award_amount(sb)
+                result["award_text"] = award_text
+                result["award_amount"] = award_amount
+                print(f"  金额文字: '{award_text}' | 提取: +¥{award_amount}")
+
+                try:
+                    sb.save_screenshot("checkin_result.png")
+                except Exception:
+                    pass
+                return result
+
+            # ===========================================================
+            # 5. 未找到任何签到相关按钮
+            # ===========================================================
+            if state == "not_found":
+                print(f"⚠️ 未找到签到按钮")
+                print(f"  所有按钮: {info.get('all_buttons')}")
+                result["error"] = "未找到签到按钮"
                 sb.save_screenshot("no_checkin_button.png")
                 return result
 
-            result["button_before"] = info.get("text", "")
-            print(f"  ✅ 找到按钮: '{info.get('text')}'")
-
             # ===========================================================
-            # 4. 点击签到
+            # 6. 按钮是"立即签到" → 执行签到
             # ===========================================================
-            print("🖱️ 点击'立即签到'…")
+            print(f"  ✅ 找到'立即签到'按钮，开始签到…")
             sb.uc_click("[data-checkin-target='1']", reconnect_time=2)
             result["checkin_clicked"] = True
             print("✅ 已点击")
 
-            # ===========================================================
-            # 5. 等 CF 弹窗 + 处理
-            # ===========================================================
+            # 等 CF 弹窗
             print("⏳ 等待 CF 弹窗渲染（3 秒）…")
             sb.sleep(3)
 
@@ -203,73 +282,18 @@ def browser_checkin():
                     pass
                 sb.sleep(3)
 
-            # ===========================================================
-            # 6. 等签到请求完成
-            # ===========================================================
+            # 等签到请求完成
             print("⏳ 等待签到请求完成（15 秒）…")
             sb.sleep(15)
 
             # ===========================================================
-            # 7. 精确读取"今天 +¥XX.XX"金额（关键修复）
+            # 7. 读取金额 + 按钮状态
             # ===========================================================
             print("💰 读取签到奖励金额…")
-
-            # 优先用 CSS 选择器定位那个 <p class="text-muted-foreground...">
-            award_text = sb.execute_script("""
-                (function() {
-                    // 方式1：精确匹配 class 含 text-muted-foreground 的 p
-                    const candidates = document.querySelectorAll(
-                        'p.text-muted-foreground, p[class*="text-muted-foreground"], [class*="line-clamp-2"]'
-                    );
-                    for (let el of candidates) {
-                        const t = (el.textContent || '').trim();
-                        // 只保留形如"今天 +¥70.97"的文字
-                        if (t.includes('今天') && t.includes('¥')) {
-                            return t;
-                        }
-                    }
-                    // 方式2：全页扫描，找最像"今天 +¥XX.XX"的短文本
-                    const all = document.querySelectorAll('p, span, div');
-                    for (let el of all) {
-                        if (el.children.length > 0) continue;  // 只看叶子节点
-                        const t = (el.textContent || '').trim();
-                        if (t.length < 30 && /今天\\s*\\+\\s*¥/.test(t)) {
-                            return t;
-                        }
-                    }
-                    return '';
-                })()
-            """)
-            print(f"  金额文字: '{award_text}'")
+            award_text, award_amount = read_award_amount(sb)
             result["award_text"] = award_text
-
-            # 用正则提取金额数字
-            m = re.search(r'[+＋]\s*¥\s*([\d.]+)', award_text)
-            if m:
-                result["award_amount"] = m.group(1)
-                print(f"  ✅ 提取到金额: +¥{result['award_amount']}")
-            else:
-                print("  ⚠️ 未能从文字中提取金额")
-
-            # ===========================================================
-            # 8. 读取提示 + 按钮状态
-            # ===========================================================
-            print("📢 读取页面提示…")
-            toast = sb.execute_script("""
-                (function() {
-                    const sels = [
-                        '[class*="toast"]', '[class*="alert"]', '[role="alert"]',
-                        '[data-sonner-toast]', '[data-slot="toast"]',
-                        '[aria-live="polite"]', '[aria-live="assertive"]'
-                    ].join(',');
-                    const texts = Array.from(document.querySelectorAll(sels))
-                        .map(t => (t.textContent || '').trim())
-                        .filter(t => t && t.length < 200);
-                    return JSON.stringify(texts);
-                })()
-            """)
-            print(f"  页面提示: {toast}")
-            result["toast"] = toast
+            result["award_amount"] = award_amount
+            print(f"  金额文字: '{award_text}' | 提取: +¥{award_amount}")
 
             print("🔍 检查按钮状态…")
             btn_state = sb.execute_script("""
@@ -289,7 +313,6 @@ def browser_checkin():
 
             try:
                 sb.save_screenshot("checkin_result.png")
-                print("  📸 截图已保存")
             except Exception:
                 pass
 
@@ -329,13 +352,12 @@ def main():
         send_notification(msg)
         sys.exit(1)
 
-    # 判定成功
+    already = r.get("already_done", False)
     btn_after = str(r.get("button_after", ""))
-    success = "已签到" in btn_after
-
-    # 金额
     amount = r.get("award_amount", "")
     award_text = r.get("award_text", "")
+
+    # 金额行
     if amount:
         amount_line = f"💰 本次奖励: +¥{amount}\n"
     elif award_text:
@@ -343,9 +365,13 @@ def main():
     else:
         amount_line = ""
 
+    # 判定成功
+    success = already or ("已签到" in btn_after)
+
     if success:
+        title = "✅ 今日已签到" if already else "✅ 签到成功"
         msg = (f"🎁 iamhc 签到通知\n\n"
-               f"✅ 签到成功\n"
+               f"{title}\n"
                f"{amount_line}"
                f"🖱️ 按钮状态: {btn_after}\n"
                f"⏱️ {now}\n{BASE_URL}")
