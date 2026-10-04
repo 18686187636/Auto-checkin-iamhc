@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-iamhc 纯浏览器自动签到 v11
-- 金额提取带完整诊断输出，打印所有 '今天 +¥' 候选元素
-- 优先根据卡片标题（"每日签到"）定位正确的金额
-"""
-
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
 
