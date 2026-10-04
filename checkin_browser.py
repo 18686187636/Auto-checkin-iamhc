@@ -87,7 +87,9 @@ def browser_checkin():
             sb.sleep(0.5)
             sb.type("input[name='password']", PASSWORD)
             sb.sleep(0.5)
-            print(f"  用户名: '{sb.get_value(\"input[name='username']\")}'")
+
+            username_val = sb.get_value("input[name='username']")
+            print(f"  用户名: '{username_val}'")
 
             # ===========================================================
             # 4. 勾选法律同意
@@ -99,7 +101,8 @@ def browser_checkin():
                 if sb.get_attribute(consent, "aria-checked") != "true":
                     sb.click(consent)
                     sb.sleep(0.8)
-                print(f"  复选框 aria-checked = {sb.get_attribute(consent, 'aria-checked')}")
+                checked_val = sb.get_attribute(consent, "aria-checked")
+                print(f"  复选框 aria-checked = {checked_val}")
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
@@ -213,10 +216,8 @@ def browser_checkin():
             except Exception:
                 pass
 
-            # 等待 Turnstile token 出现在签到请求里（可能弹出 dialog）
             for i in range(20):
                 sb.sleep(1)
-                # 检查是否有新的 iframe
                 if sb.is_element_present("iframe[src*='challenges.cloudflare.com']"):
                     try:
                         sb.uc_gui_click_captcha()
@@ -239,7 +240,6 @@ def browser_checkin():
             print(f"  页面提示: {toast}")
             result["toast"] = toast
 
-            # 兜底：截个图
             try:
                 sb.save_screenshot("checkin_result.png")
                 print("  📸 截图已保存: checkin_result.png")
@@ -269,7 +269,6 @@ def main():
     now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
     r = browser_checkin()
 
-    # ---------- 判定结果 ----------
     if not r.get("logged_in"):
         msg = f"❌ iamhc 登录失败\n⏱️ {now}"
         print(msg)
@@ -283,7 +282,6 @@ def main():
         send_notification(msg)
         sys.exit(1)
 
-    # 判断签到是否成功
     toast_str = str(r.get("toast", ""))
     success = any(k in toast_str for k in ("成功", "获得", "已签到", "重复", "success", "Success"))
 
