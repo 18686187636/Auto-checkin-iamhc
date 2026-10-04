@@ -3,13 +3,13 @@
 
 """
 iamhc 自动签到脚本
-认证优先级：COOKIES（用 new_api_refresh 换 access_token） > 浏览器登录兜底
+认证：COOKIES → refresh → access_token
+签到：API 优先，遇 Turnstile 则切换浏览器自动签到
 """
 
 import os, sys, time, json, requests
 from datetime import datetime, timezone, timedelta
 
-# ---- 环境变量 ----
 EMAIL        = os.environ.get("EMAIL") or ""
 PASSWORD     = os.environ.get("PASSWORD") or ""
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN") or ""
@@ -27,7 +27,7 @@ LOGIN_PATH = "/sign-in"
 
 
 # ===========================================================================
-# 工具
+# 工具函数
 # ===========================================================================
 def parse_cookie_string(s):
     cookies = {}
@@ -97,13 +97,9 @@ def fmt_usd(v):         return str(round(v))
 
 
 # ===========================================================================
-# 用 new_api_refresh cookie 换 access_token（修正端点为 /api/user/auth/refresh）
+# 刷新 access_token（端点已修正）
 # ===========================================================================
 def refresh_access_token(session):
-    """
-    使用 new_api_refresh cookie 调 /api/user/auth/refresh，
-    返回 (access_token, user_id)，失败返回 (None, None)。
-    """
     url = f"{BASE_URL}/api/user/auth/refresh"
     try:
         r = session.post(url, json={}, timeout=20)
@@ -114,17 +110,14 @@ def refresh_access_token(session):
         try:
             d = r.json()
         except ValueError:
-            print(f"      响应非 JSON: {r.text[:150]}")
             return None, None
         if not d.get("success"):
             print(f"      业务失败: {d.get('message', '')}")
             return None, None
         payload = d.get("data") or {}
-        token = (payload.get("access_token")
-                 or payload.get("token")
-                 or "")
+        token = payload.get("access_token") or payload.get("token") or ""
         ud = payload.get("user") or payload
-        uid = (ud.get("id") or ud.get("user_id") or ud.get("uid"))
+        uid = ud.get("id") or ud.get("user_id") or ud.get("uid")
         if token and uid:
             print(f"    ✅ 刷新成功 | token 长度 {len(token)} | USER_ID={uid}")
             return token, uid
@@ -136,13 +129,148 @@ def refresh_access_token(session):
 
 
 # ===========================================================================
-# 浏览器登录（最终兜底）
+# 浏览器自动签到（新增：签到接口需要 Turnstile）
 # ===========================================================================
-def get_auth_via_browser():
-    """启动浏览器登录，返回 (access_token, user_id, cookies)。"""
+def browser_auto_checkin(cookies_dict):
+    """
+    用浏览器打开签到页，注入 cookies 保持登录态，
+    找到签到按钮点击，自动过 Turnstile，返回页面提示信息。
+    """
     from seleniumbase import SB
 
-    print("🚀 启动浏览器（UC 模式）…")
+    print("  🚀 启动浏览器自动签到…")
+
+    with SB(
+        uc=True,
+        headed=True,
+        xvfb=False,
+        incognito=True,
+        locale_code="zh-CN",
+        window_size="1920,1080",
+        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
+    ) as sb:
+        try:
+            # 1. 打开站点
+            print("  🌐 打开站点首页…")
+            sb.uc_open_with_reconnect(BASE_URL, reconnect_time=4)
+            sb.sleep(2)
+
+            # 2. 注入 cookies 保持登录态
+            if cookies_dict:
+                print(f"  🍪 注入 {len(cookies_dict)} 个 cookies…")
+                for name, value in cookies_dict.items():
+                    try:
+                        cookie = {
+                            "name": name,
+                            "value": value,
+                            "domain": "api.hcnsec.cn",
+                            "path": "/",
+                            "secure": False,
+                        }
+                        if name == "new_api_refresh":
+                            cookie["path"] = "/api/user/auth"
+                        if name in ("session", "new_api_refresh"):
+                            cookie["httpOnly"] = True
+                        sb.add_cookie(cookie)
+                    except Exception as e:
+                        print(f"    注入 {name} 失败: {e}")
+
+            # 3. 打开签到页面
+            print("  📄 打开签到页面…")
+            page_ok = False
+            for path in ["/console", "/dashboard", "/dashboard/overview", "/console/personal"]:
+                try:
+                    sb.open(f"{BASE_URL}{path}")
+                    sb.sleep(3)
+                    cur = sb.get_current_url()
+                    if "sign-in" not in cur and "login" not in cur:
+                        print(f"    已打开: {cur}")
+                        page_ok = True
+                        break
+                except Exception as e:
+                    print(f"    {path} 打开失败: {e}")
+
+            if not page_ok:
+                print("  ❌ 无法打开签到页面")
+                return None
+
+            # 4. 列出所有按钮文字（帮你排查）
+            print("  🔍 扫描页面按钮…")
+            btns = sb.execute_script("""
+                return JSON.stringify(
+                    Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                        .map(b => (b.textContent || '').trim())
+                        .filter(t => t && t.length < 30)
+                );
+            """)
+            print(f"    按钮列表: {btns}")
+
+            # 5. 点击含"签到"的按钮
+            clicked = sb.execute_script("""
+                const elems = document.querySelectorAll('button, a, [role="button"]');
+                for (let i = 0; i < elems.length; i++) {
+                    const t = (elems[i].textContent || '').trim();
+                    if (t && t.length < 20 && (t === '签到' || t === '每日签到' || t.includes('签到'))) {
+                        elems[i].setAttribute('data-chk', '1');
+                        elems[i].click();
+                        return t;
+                    }
+                }
+                return '';
+            """)
+
+            if not clicked:
+                print("  ⚠️ 未找到签到按钮，请从上面日志确认按钮文字")
+                return None
+
+            print(f"  ✅ 已点击: '{clicked}'")
+            sb.sleep(5)
+
+            # 6. 处理可能弹出的 Turnstile
+            try:
+                sb.uc_gui_click_captcha()
+            except Exception:
+                pass
+            sb.sleep(3)
+
+            # 7. 读取提示信息
+            result = sb.execute_script("""
+                const sels = '[class*="toast"], [class*="alert"], [class*="message"], [role="alert"], [class*="notification"], .Toastify__toast';
+                const toasts = document.querySelectorAll(sels);
+                return JSON.stringify(
+                    Array.from(toasts).map(t => (t.textContent || '').trim()).filter(Boolean)
+                );
+            """)
+            print(f"  📢 页面提示: {result}")
+
+            # 8. 打印更新后的 cookies（可能被刷新）
+            try:
+                raw = sb.driver.get_cookies()
+                if raw:
+                    new_cookies = {c["name"]: c["value"] for c in raw}
+                    cookie_str = "; ".join([f"{k}={v}" for k, v in new_cookies.items()])
+                    print("\n  📋 更新后的 cookies（如需替换 Secrets）：")
+                    print(f"  {cookie_str}\n")
+            except Exception:
+                pass
+
+            return result
+        except Exception as e:
+            print(f"  ❌ 浏览器签到异常: {e}")
+            try:
+                sb.save_screenshot("browser_checkin_error.png")
+            except Exception:
+                pass
+            return None
+
+
+# ===========================================================================
+# 浏览器登录（兜底，cookies 完全失效时）
+# ===========================================================================
+def get_auth_via_browser():
+    from seleniumbase import SB
+
+    print("🚀 启动浏览器登录…")
     with SB(
         uc=True,
         headed=True,
@@ -160,7 +288,6 @@ def get_auth_via_browser():
             print("⏳ 等待登录表单…")
             sb.wait_for_element_visible("input[name='username']", timeout=30)
             sb.wait_for_element_visible("input[name='password']", timeout=10)
-            print("✅ 登录表单已加载")
 
             print("✍️ 填写登录凭证…")
             sb.type("input[name='username']", EMAIL)
@@ -168,7 +295,7 @@ def get_auth_via_browser():
             sb.type("input[name='password']", PASSWORD)
             sb.sleep(0.5)
 
-            print("☑️ 勾选法律同意复选框…")
+            print("☑️ 勾选法律同意…")
             consent = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
             try:
                 sb.wait_for_element_present(consent, timeout=10)
@@ -176,125 +303,61 @@ def get_auth_via_browser():
                     sb.click(consent)
                     sb.sleep(0.6)
             except Exception as e:
-                print(f"⚠️ 勾选复选框异常: {e}")
+                print(f"⚠️ 勾选异常: {e}")
 
             print("⏳ 等待 Turnstile…")
             sb.sleep(5)
             try:
                 sb.uc_gui_click_captcha()
             except Exception as e:
-                print(f"⚠️ uc_gui_click_captcha 异常: {e}")
+                print(f"⚠️ click_captcha 异常: {e}")
 
-            print("⏳ 等待 Turnstile token…")
             for i in range(60):
                 token = sb.execute_script(
                     'return (document.querySelector(\'[name="cf-turnstile-response"]\') || {}).value || "";'
                 )
                 if token:
-                    print(f"✅ Turnstile token 已生成 | 长度: {len(token)}")
+                    print(f"✅ Turnstile token 长度: {len(token)}")
                     break
                 sb.sleep(1)
 
-            print("🖱️ 点击登录按钮…")
+            print("🖱️ 点击登录…")
             sb.wait_for_element_visible("button[type='submit']", timeout=10)
             sb.click("button[type='submit']")
 
             print("⏳ 等待登录完成…")
-            login_ok = False
             for i in range(30):
                 sb.sleep(2)
-                cur = sb.get_current_url()
-                if LOGIN_PATH not in cur:
-                    login_ok = True
-                    print(f"✅ 登录成功，当前 URL: {cur}")
+                if LOGIN_PATH not in sb.get_current_url():
+                    print(f"✅ 登录成功: {sb.get_current_url()}")
                     break
-            if not login_ok:
-                print("⚠️ 未检测到 URL 变化")
-                sb.save_screenshot("login_failed.png")
 
-            # 等待前端写入 Cookie 和 localStorage
-            print("⏳ 等待前端写入 cookie/localStorage…")
             sb.sleep(5)
 
-            # 提取 cookies（多渠道尝试）
-            print("🍪 提取 cookies…")
             cookies = {}
             try:
                 raw = sb.driver.get_cookies()
                 if raw:
                     cookies = {c["name"]: c["value"] for c in raw}
-                    print(f"  driver.get_cookies: {len(cookies)} 个 -> {list(cookies.keys())}")
+                    print(f"🍪 提取 cookies: {list(cookies.keys())}")
             except Exception as e:
-                print(f"  driver.get_cookies 失败: {e}")
+                print(f"  cookies 提取失败: {e}")
 
-            if len(cookies) < 2:
-                try:
-                    raw = sb.execute_cdp_cmd("Network.getAllCookies", {})
-                    clist = raw.get("cookies", [])
-                    if clist:
-                        cookies = {c["name"]: c["value"] for c in clist}
-                        print(f"  CDP getAllCookies: {len(cookies)} 个 -> {list(cookies.keys())}")
-                except Exception as e:
-                    print(f"  CDP getAllCookies 失败: {e}")
-
-            # 从 localStorage 提取 access_token
-            access_token = ""
-            user_id = None
-            try:
-                auth_json = sb.execute_script("""
-                    try {
-                        let userStr = localStorage.getItem('user');
-                        if (userStr) {
-                            const u = JSON.parse(userStr);
-                            if (u && u.access_token) {
-                                return JSON.stringify({
-                                    token: u.access_token,
-                                    uid: u.id || u.user_id || u.uid || null
-                                });
-                            }
-                        }
-                        for (let i = 0; i < localStorage.length; i++) {
-                            const val = localStorage.getItem(localStorage.key(i));
-                            if (val && val.startsWith('eyJ') && val.length > 100) {
-                                return JSON.stringify({token: val, uid: null});
-                            }
-                        }
-                        return '';
-                    } catch(e) { return ''; }
-                """)
-                if auth_json:
-                    d = json.loads(auth_json)
-                    access_token = d.get("token", "")
-                    user_id = d.get("uid")
-                    if access_token:
-                        print(f"  localStorage: 找到 access_token（长度 {len(access_token)}）")
-            except Exception as e:
-                print(f"  localStorage 提取失败: {e}")
-
-            # 打印结果
-            print("\n" + "=" * 70)
             if cookies:
                 cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
-                print("📋 请复制以下内容到 GitHub Secrets 的 COOKIES：")
-                print("=" * 70)
+                print("\n" + "=" * 70)
+                print("📋 请复制到 GitHub Secrets 的 COOKIES：")
                 print(cookie_str)
-                print("=" * 70)
-            if access_token:
-                print("📋 可选：ACCESS_TOKEN / USER_ID")
-                print(f"ACCESS_TOKEN = {access_token}")
-                print(f"USER_ID      = {user_id}")
-                print("=" * 70)
-            print()
+                print("=" * 70 + "\n")
 
-            return access_token, user_id, cookies
-
+            return cookies
         except Exception as e:
-            print(f"❌ 浏览器自动化异常: {e}")
+            print(f"❌ 浏览器登录异常: {e}")
             try:
-                sb.save_screenshot("error_screenshot.png")
+                sb.save_screenshot("login_error.png")
             except Exception:
                 pass
-            return None, None, None
+            return None
 
 
 # ===========================================================================
@@ -320,32 +383,28 @@ def send_notification(message):
 def main():
     session = None
     info = None
+    cookies_dict = {}
 
-    # ---------- 优先级 1：ACCESS_TOKEN + USER_ID（如果手动配置了） ----------
+    # ---------- 优先级 1：ACCESS_TOKEN ----------
     if ACCESS_TOKEN and USER_ID:
-        print(f"🔑 尝试 ACCESS_TOKEN（长度 {len(ACCESS_TOKEN)}）+ USER_ID={USER_ID}")
+        print(f"🔑 尝试 ACCESS_TOKEN（长度 {len(ACCESS_TOKEN)}）")
         session = make_session_with_token(ACCESS_TOKEN, USER_ID)
         info = get_user_info(session)
         if info:
             print(f"✅ ACCESS_TOKEN 有效 | 用户: {info.get('username', '')}")
         else:
-            print("⚠️ ACCESS_TOKEN 失效，继续下一路径")
+            print("⚠️ ACCESS_TOKEN 失效")
             session = None
-    else:
-        print("ℹ️ 未配置 ACCESS_TOKEN/USER_ID")
 
-    # ---------- 优先级 2：COOKIES（用 new_api_refresh 换 token） ----------
+    # ---------- 优先级 2：COOKIES ----------
     if session is None and COOKIES:
         print("🔑 尝试 COOKIES…")
-        cookie_dict = parse_cookie_string(COOKIES)
-        print(f"  解析到 {len(cookie_dict)} 个 cookie: {list(cookie_dict.keys())}")
-
-        # 2.1 先直接用 cookies 试 /api/user/self
-        session = make_session_with_cookies(cookie_dict)
+        cookies_dict = parse_cookie_string(COOKIES)
+        print(f"  解析到 {len(cookies_dict)} 个 cookie: {list(cookies_dict.keys())}")
+        session = make_session_with_cookies(cookies_dict)
         info = get_user_info(session)
 
-        # 2.2 失败 → 用 new_api_refresh 换 access_token
-        if not info and "new_api_refresh" in cookie_dict:
+        if not info and "new_api_refresh" in cookies_dict:
             print("  直接调用失败，用 new_api_refresh 刷新 access_token…")
             token, uid = refresh_access_token(session)
             if token and uid:
@@ -355,32 +414,22 @@ def main():
         if info:
             print(f"✅ COOKIES 有效 | 用户: {info.get('username', '')}")
         else:
-            print("⚠️ COOKIES 已失效，回退浏览器登录")
+            print("⚠️ COOKIES 已失效")
             session = None
 
     # ---------- 优先级 3：浏览器登录兜底 ----------
     if session is None:
         if not EMAIL or not PASSWORD:
-            print("❌ 无法回退：未配置 EMAIL 和 PASSWORD")
-            send_notification("❌ iamhc 所有认证方式失败：COOKIES 已失效且未配置 EMAIL/PASSWORD")
+            msg = "❌ 无法回退：未配置 EMAIL / PASSWORD"
+            print(msg)
+            send_notification(msg)
             sys.exit(1)
         print("🌐 回退到浏览器登录…")
-        access_token, user_id, cookies = get_auth_via_browser()
-
-        # 3.1 优先用 access_token 直接调
-        if access_token and user_id:
-            session = make_session_with_token(access_token, user_id)
+        new_cookies = get_auth_via_browser()
+        if new_cookies:
+            cookies_dict = new_cookies
+            session = make_session_with_cookies(new_cookies)
             info = get_user_info(session)
-
-        # 3.2 access_token 无效 → 用浏览器拿到的 cookies 换
-        if (not info) and cookies:
-            print("  用浏览器 cookies 刷新 access_token…")
-            s2 = make_session_with_cookies(cookies)
-            token, uid = refresh_access_token(s2)
-            if token and uid:
-                session = make_session_with_token(token, uid)
-                info = get_user_info(session)
-
         if not info:
             msg = "❌ iamhc 所有认证方式均失败"
             print(msg)
@@ -393,32 +442,71 @@ def main():
     bal_before = quota_to_dollar(info.get("quota", 0))
     print(f"👤 {username} | ID: {uid} | 余额: {fmt_usd(bal_before)}$")
 
+    print("📡 尝试 API 签到…")
     ck = checkin(session)
-    info2 = get_user_info(session)
-    bal_after = quota_to_dollar(info2.get("quota", 0)) if info2 else bal_before
+    print(f"  响应: {ck}")
 
     now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
-    ok = ck.get("success", False)
     msg = str(ck.get("message", "") or "")
 
-    if ok:
+    # API 签到成功
+    if ck.get("success"):
+        info2 = get_user_info(session)
+        bal_after = quota_to_dollar(info2.get("quota", 0)) if info2 else bal_before
         awarded = (ck.get("data") or {}).get("quota_awarded", 0) or 0
         awarded_d = quota_to_dollar(awarded) if awarded else (bal_after - bal_before)
         print(f"✅ 签到成功 | 获得 {fmt_usd(awarded_d)}$")
         message = (f"🎁 iamhc 签到通知\n\n✅ 签到成功，获得 {fmt_usd(awarded_d)}$\n"
                    f"👤 {username}\n💰 昨日: {fmt_usd(bal_before)}$\n"
                    f"💰 当前: {fmt_usd(bal_after)}$\n⏱️ {now}\n{BASE_URL}")
-    elif any(k in msg for k in ("已签到", "重复签到", "今天已签到")):
-        print(f"✅ 今日已签到 | 余额: {fmt_usd(bal_after)}$")
-        message = (f"🎁 iamhc 签到通知\n\n✅ 今日已签到\n"
-                   f"👤 {username}\n💰 昨日: {fmt_usd(bal_before)}$\n"
-                   f"💰 当前: {fmt_usd(bal_after)}$\n⏱️ {now}\n{BASE_URL}")
-    else:
-        print(f"❌ 签到失败 | {msg}")
-        message = (f"🎁 iamhc 签到通知\n\n❌ 签到失败: {msg}\n"
-                   f"👤 {username}\n💰 昨日: {fmt_usd(bal_before)}$\n"
-                   f"💰 当前: {fmt_usd(bal_after)}$\n⏱️ {now}\n{BASE_URL}")
+        send_notification(message)
+        return
 
+    # 已签到
+    if any(k in msg for k in ("已签到", "重复签到", "今天已签到")):
+        print(f"✅ 今日已签到")
+        message = (f"🎁 iamhc 签到通知\n\n✅ 今日已签到\n"
+                   f"👤 {username}\n💰 余额: {fmt_usd(bal_before)}$\n"
+                   f"⏱️ {now}\n{BASE_URL}")
+        send_notification(message)
+        return
+
+    # 需要 Turnstile → 浏览器自动签到
+    if "Turnstile" in msg or "turnstile" in msg:
+        print("⚠️ 签到接口需要 Turnstile token，切换浏览器自动签到…")
+        result = browser_auto_checkin(cookies_dict)
+        print(f"  浏览器签到结果: {result}")
+
+        # 浏览器签到后，用 API 复查余额
+        try:
+            info2 = get_user_info(session)
+            bal_after = quota_to_dollar(info2.get("quota", 0)) if info2 else bal_before
+        except Exception:
+            bal_after = bal_before
+
+        success_browser = False
+        result_str = str(result or "")
+        if any(k in result_str for k in ("成功", "获得", "已签到", "重复", "success")):
+            success_browser = True
+
+        if success_browser:
+            message = (f"🎁 iamhc 签到通知\n\n✅ 浏览器签到完成\n"
+                       f"📢 页面提示: {result_str[:200]}\n"
+                       f"👤 {username}\n💰 昨日: {fmt_usd(bal_before)}$\n"
+                       f"💰 当前: {fmt_usd(bal_after)}$\n⏱️ {now}\n{BASE_URL}")
+        else:
+            message = (f"🎁 iamhc 签到通知\n\n⚠️ 浏览器签到返回异常\n"
+                       f"📢 页面提示: {result_str[:200]}\n"
+                       f"👤 {username}\n💰 余额: {fmt_usd(bal_before)}$\n"
+                       f"⏱️ {now}\n{BASE_URL}")
+        send_notification(message)
+        return
+
+    # 其他失败
+    print(f"❌ 签到失败 | {msg}")
+    message = (f"🎁 iamhc 签到通知\n\n❌ 签到失败: {msg}\n"
+               f"👤 {username}\n💰 余额: {fmt_usd(bal_before)}$\n"
+               f"⏱️ {now}\n{BASE_URL}")
     send_notification(message)
 
 
