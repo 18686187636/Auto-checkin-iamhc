@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+
+
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
 
@@ -17,9 +19,6 @@ LOGIN_PATH = "/sign-in"
 PROFILE_URL = f"{BASE_URL}/profile"
 
 
-# ===========================================================================
-# 通知
-# ===========================================================================
 def send_notification(message):
     print("\n" + "=" * 30)
     print(message)
@@ -34,39 +33,37 @@ def send_notification(message):
             print("Telegram 异常:", e)
 
 
-# ===========================================================================
-# 精确读取奖励金额（修正版）
-# ===========================================================================
 def read_award_amount(sb):
-    """精确读取页面上的'今天 +¥XX.XX'，优先匹配特定的 <p> 标签"""
+    """读取"每日签到"卡片内的今日奖励金额"""
     award_text = sb.execute_script("""
         (function() {
-            // 优先精确匹配用户提供的 <p> 结构
-            const precise = document.querySelector(
-                'p.text-muted-foreground.mt-1.line-clamp-2, p[class*="line-clamp-2"][class*="text-muted-foreground"]'
-            );
-            if (precise) {
-                const t = (precise.textContent || '').trim();
-                if (t.includes('今天') && t.includes('¥')) {
-                    return t;
+            // 1. 找到"每日签到"标题
+            const h3s = document.querySelectorAll('h3');
+            let card = null;
+            for (let h of h3s) {
+                if ((h.textContent || '').trim() === '每日签到') {
+                    card = h.closest('button') || h.closest('div[class*="border"]') || h.parentElement;
+                    if (card && !card.querySelector('p')) {
+                        card = card.parentElement;
+                    }
+                    break;
                 }
             }
-            // 备选：更宽泛的 class 匹配
-            const candidates = document.querySelectorAll(
-                'p.text-muted-foreground, p[class*="text-muted-foreground"], [class*="line-clamp-2"]'
-            );
-            for (let el of candidates) {
-                const t = (el.textContent || '').trim();
-                if (t.includes('今天') && t.includes('¥')) {
-                    return t;
+            // 2. 在卡片内找"今天 +¥XX.XX"
+            if (card) {
+                const ps = card.querySelectorAll('p');
+                for (let p of ps) {
+                    const t = (p.textContent || '').trim();
+                    if (t.includes('今天') && t.includes('¥')) {
+                        return t;
+                    }
                 }
             }
-            // 最后备选：全页扫描叶子节点
-            const all = document.querySelectorAll('p, span, div');
-            for (let el of all) {
-                if (el.children.length > 0) continue;
-                const t = (el.textContent || '').trim();
-                if (t.length < 30 && /今天\\s*\\+\\s*¥/.test(t)) {
+            // 3. 兜底：找带 line-clamp-2 的 <p>
+            const precise = document.querySelectorAll('p.line-clamp-2, p[class*="line-clamp-2"]');
+            for (let p of precise) {
+                const t = (p.textContent || '').trim();
+                if (t.includes('今天') && t.includes('¥')) {
                     return t;
                 }
             }
@@ -80,9 +77,6 @@ def read_award_amount(sb):
     return award_text or "", amount
 
 
-# ===========================================================================
-# 浏览器流程
-# ===========================================================================
 def browser_checkin():
     from seleniumbase import SB
 
@@ -109,9 +103,7 @@ def browser_checkin():
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
     ) as sb:
         try:
-            # -----------------------------------------------------------
-            # 1. 登录
-            # -----------------------------------------------------------
+            # ---------- 登录 ----------
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
@@ -172,9 +164,7 @@ def browser_checkin():
 
             sb.sleep(3)
 
-            # -----------------------------------------------------------
-            # 2. 打开个人资料页
-            # -----------------------------------------------------------
+            # ---------- 打开个人资料页 ----------
             print("📄 打开个人资料页面…")
             sb.open(PROFILE_URL)
             sb.sleep(4)
@@ -184,9 +174,7 @@ def browser_checkin():
                 result["error"] = "登录状态失效"
                 return result
 
-            # -----------------------------------------------------------
-            # 3. 检测按钮当前状态
-            # -----------------------------------------------------------
+            # ---------- 检测按钮状态 ----------
             print("🔍 检测签到按钮状态…")
             btn_info = sb.execute_script("""
                 (function() {
@@ -228,9 +216,7 @@ def browser_checkin():
             state = info.get("state", "not_found")
             result["button_before"] = info.get("text", "")
 
-            # -----------------------------------------------------------
-            # 4. 已签到 → 直接读金额
-            # -----------------------------------------------------------
+            # ---------- 已签到 → 读金额 ----------
             if state == "already":
                 print(f"✅ 今日已签到 | 按钮: '{info.get('text')}'")
                 result["already_done"] = True
@@ -248,9 +234,7 @@ def browser_checkin():
                     pass
                 return result
 
-            # -----------------------------------------------------------
-            # 5. 未找到按钮
-            # -----------------------------------------------------------
+            # ---------- 未找到按钮 ----------
             if state == "not_found":
                 print(f"⚠️ 未找到签到按钮")
                 print(f"  所有按钮: {info.get('all_buttons')}")
@@ -258,9 +242,7 @@ def browser_checkin():
                 sb.save_screenshot("no_checkin_button.png")
                 return result
 
-            # -----------------------------------------------------------
-            # 6. 按钮是"立即签到" → 执行签到
-            # -----------------------------------------------------------
+            # ---------- 执行签到 ----------
             print(f"  ✅ 找到'立即签到'按钮，开始签到…")
             sb.uc_click("[data-checkin-target='1']", reconnect_time=2)
             result["checkin_clicked"] = True
@@ -280,9 +262,7 @@ def browser_checkin():
             print("⏳ 等待签到请求完成（15 秒）…")
             sb.sleep(15)
 
-            # -----------------------------------------------------------
-            # 7. 读取金额 + 按钮状态
-            # -----------------------------------------------------------
+            # ---------- 读取金额 + 按钮状态 ----------
             print("💰 读取签到奖励金额…")
             award_text, award_amount = read_award_amount(sb)
             result["award_text"] = award_text
@@ -322,9 +302,6 @@ def browser_checkin():
             return result
 
 
-# ===========================================================================
-# 主流程
-# ===========================================================================
 def main():
     if not EMAIL or not PASSWORD:
         print("❌ 请设置 EMAIL 和 PASSWORD 环境变量")
@@ -352,7 +329,7 @@ def main():
     award_text = r.get("award_text", "")
 
     if amount:
-        amount_line = f"💰 本次奖励: +¥{amount}\n"
+        amount_line = f"💰 今日奖励: +¥{amount}\n"
     elif award_text:
         amount_line = f"💰 奖励信息: {award_text}\n"
     else:
