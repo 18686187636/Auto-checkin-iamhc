@@ -3,8 +3,9 @@
 
 """
 iamhc 自动签到脚本（浏览器自动化版）
-通过 SeleniumBase CDP Mode 启动真实浏览器，自动通过 Cloudflare Turnstile，
-勾选法律同意复选框，完成登录后提取 cookies，再调用签到 API。
+通过 SeleniumBase CDP Mode 启动真实浏览器，使用 gui_type 模拟真实键盘输入，
+自动勾选法律同意复选框，通过 Cloudflare Turnstile，完成登录后提取 cookies，
+再调用签到 API。
 """
 
 import os, sys, time, json, requests
@@ -49,63 +50,35 @@ def get_cookies_via_browser():
             sb.sleep(5)
 
             # -----------------------------------------------------------
-            # 2. 等待 Turnstile 组件出现
+            # 2. 等待 Turnstile 组件出现（仅检测，不等待通过）
             # -----------------------------------------------------------
-            print("⏳ 等待 Turnstile 验证组件…")
-            turnstile_found = False
+            print("⏳ 等待 Turnstile 组件加载…")
             for i in range(30):
                 if (sb.is_element_present("iframe[src*='challenges.cloudflare.com']")
                         or sb.is_element_present("div.cf-turnstile")
                         or sb.is_element_present("#turnstile-captcha")):
-                    turnstile_found = True
                     print(f"✅ 检测到 Turnstile 组件（第 {i+1} 次检查）")
                     break
                 sb.sleep(2)
-            if not turnstile_found:
+            else:
                 print("⚠️ 未检测到 Turnstile 组件，可能已自动通过或页面结构变化")
 
             # -----------------------------------------------------------
-            # 3. 等待 Turnstile 自动通过
+            # 3. 填写登录凭证（gui_type 真实键盘输入）
             # -----------------------------------------------------------
-            print("⏳ 等待 Turnstile 验证自动通过…")
-            turnstile_passed = False
-            for i in range(40):
-                sb.sleep(3)
-                if not sb.is_element_present("iframe[src*='challenges.cloudflare.com']"):
-                    turnstile_passed = True
-                    print(f"✅ Turnstile 已通过（第 {(i+1)*3} 秒）")
-                    break
-                try:
-                    if sb.is_element_visible("div.cf-turnstile input[type='checkbox']"):
-                        sb.cdp.gui_click_element("div.cf-turnstile input[type='checkbox']")
-                        print("🖱️ 已点击 Turnstile checkbox")
-                except Exception:
-                    pass
-            if not turnstile_passed:
-                print("⚠️ Turnstile 等待超时，继续尝试登录…")
-
-            # -----------------------------------------------------------
-            # 4. 填写登录凭证（JavaScript 设置 React 状态）
-            # -----------------------------------------------------------
-            print("✍️ 填写登录凭证（JavaScript 设置 React 状态）…")
+            print("✍️ 填写登录凭证（gui_type 真实键盘输入）…")
             sb.wait_for_element_visible("input[name='username']", timeout=15)
             sb.wait_for_element_visible("input[name='password']", timeout=15)
 
-            sb.execute_script(f"""
-                function setReactInputValue(input, value) {{
-                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value'
-                    ).set;
-                    nativeInputValueSetter.call(input, value);
-                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }}
-                const usernameInput = document.querySelector("input[name='username']");
-                const passwordInput = document.querySelector("input[name='password']");
-                setReactInputValue(usernameInput, {json.dumps(EMAIL)});
-                setReactInputValue(passwordInput, {json.dumps(PASSWORD)});
-            """)
-            sb.sleep(1)
+            sb.cdp.gui_click_element("input[name='username']")
+            sb.sleep(0.5)
+            sb.cdp.gui_type("input[name='username']", EMAIL)
+            sb.sleep(0.5)
+
+            sb.cdp.gui_click_element("input[name='password']")
+            sb.sleep(0.5)
+            sb.cdp.gui_type("input[name='password']", PASSWORD)
+            sb.sleep(0.5)
 
             username_val = sb.get_value("input[name='username']")
             password_val = sb.get_value("input[name='password']")
@@ -117,60 +90,35 @@ def get_cookies_via_browser():
             print("✅ 输入框内容已确认写入")
 
             # -----------------------------------------------------------
-            # 5. 勾选法律同意复选框（Base UI 自定义组件）
+            # 4. 勾选法律同意复选框
             # -----------------------------------------------------------
             print("☑️ 勾选法律同意复选框…")
             consent_selector = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
-
             try:
                 sb.wait_for_element_present(consent_selector, timeout=10)
                 aria_checked = sb.get_attribute(consent_selector, "aria-checked")
-                print(f"  当前 aria-checked = {aria_checked}")
-
                 if aria_checked != "true":
-                    try:
-                        sb.cdp.gui_click_element(consent_selector)
-                        sb.sleep(0.6)
-                    except Exception as e:
-                        print(f"  gui_click 异常: {e}")
+                    sb.cdp.gui_click_element(consent_selector)
+                    sb.sleep(1.0)
                     aria_checked = sb.get_attribute(consent_selector, "aria-checked")
-                    print(f"  gui_click 后 aria-checked = {aria_checked}")
-
-                    if aria_checked != "true":
-                        print("  gui_click 未生效，尝试 JS 派发 PointerEvent + MouseEvent…")
-                        sb.execute_script(f"""
-                            const cb = document.querySelector("{consent_selector}");
-                            if (cb) {{
-                                ['pointerdown', 'pointerup', 'click'].forEach(t => {{
-                                    cb.dispatchEvent(new PointerEvent(t, {{
-                                        bubbles: true, cancelable: true, view: window,
-                                        pointerId: 1, pointerType: 'mouse', isPrimary: true
-                                    }}));
-                                }});
-                                cb.dispatchEvent(new MouseEvent('click', {{
-                                    bubbles: true, cancelable: true, view: window
-                                }}));
-                            }}
-                        """)
-                        sb.sleep(0.6)
-                        aria_checked = sb.get_attribute(consent_selector, "aria-checked")
-                        print(f"  JS 点击后 aria-checked = {aria_checked}")
-
-                    if aria_checked == "true":
-                        print("✅ 法律同意复选框已勾选")
-                    else:
-                        print("⚠️ 复选框仍未勾选，尝试点击 label 文本…")
-                        try:
-                            sb.cdp.gui_click_element("#legal-consent-label")
-                            sb.sleep(0.6)
-                            aria_checked = sb.get_attribute(consent_selector, "aria-checked")
-                            print(f"  label 点击后 aria-checked = {aria_checked}")
-                        except Exception as e:
-                            print(f"  label 点击异常: {e}")
-                else:
-                    print("✅ 复选框已是勾选状态")
+                print(f"  复选框 aria-checked = {aria_checked}")
             except Exception as e:
                 print(f"⚠️ 勾选复选框异常: {e}")
+
+            # -----------------------------------------------------------
+            # 5. 等待 Turnstile token 生成
+            # -----------------------------------------------------------
+            print("⏳ 等待 Turnstile 验证完成…")
+            for i in range(20):
+                sb.sleep(2)
+                token_exists = sb.execute_script("""
+                    return !!document.querySelector('input[name="cf-turnstile-response"]')?.value
+                """)
+                if token_exists:
+                    print(f"✅ Turnstile token 已生成（第 {(i+1)*2} 秒）")
+                    break
+            else:
+                print("⚠️ 未检测到 Turnstile token，继续尝试登录…")
 
             # -----------------------------------------------------------
             # 6. 点击登录按钮
