@@ -4,7 +4,7 @@
 """
 iamhc 纯浏览器自动签到
 流程：浏览器打开登录页 → 填账号密码 → 勾选同意 → 过 Turnstile → 登录
-     → 打开控制台 → 点"签到"按钮 → 过 Turnstile → 读取结果
+     → 打开控制台 → 点"签到"按钮 → 处理 Turnstile 弹窗 → 读取结果
 """
 
 import os, sys, time, json, requests
@@ -167,33 +167,37 @@ def browser_checkin():
                     print(f"  {path} 打开异常: {e}")
 
             # ===========================================================
-            # 8. 扫描并点击签到按钮
+            # 8. 扫描并点击签到按钮（使用 IIFE）
             # ===========================================================
             print("🔍 扫描页面按钮…")
             btns = sb.execute_script("""
-                return JSON.stringify(
-                    Array.from(document.querySelectorAll('button, a, [role="button"]'))
-                        .map(b => (b.textContent || '').trim())
-                        .filter(t => t && t.length < 40)
-                );
+                (function() {
+                    return JSON.stringify(
+                        Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                            .map(b => (b.textContent || '').trim())
+                            .filter(t => t && t.length < 40)
+                    );
+                })()
             """)
             print(f"  按钮列表: {btns}")
 
             print("🖱️ 查找签到按钮…")
             clicked = sb.execute_script("""
-                const elems = document.querySelectorAll('button, a, [role="button"]');
-                for (let i = 0; i < elems.length; i++) {
-                    const t = (elems[i].textContent || '').trim();
-                    if (t && t.length < 25 &&
-                        (t.includes('签到') || t.includes('Check-in') ||
-                         t.includes('Check in') || t.includes('Checkin') ||
-                         t.includes('Daily'))) {
-                        elems[i].scrollIntoView({block: 'center'});
-                        elems[i].click();
-                        return t;
+                (function() {
+                    const elems = document.querySelectorAll('button, a, [role="button"]');
+                    for (let i = 0; i < elems.length; i++) {
+                        const t = (elems[i].textContent || '').trim();
+                        if (t && t.length < 25 &&
+                            (t.includes('签到') || t.includes('Check-in') ||
+                             t.includes('Check in') || t.includes('Checkin') ||
+                             t.includes('Daily'))) {
+                            elems[i].scrollIntoView({block: 'center'});
+                            elems[i].click();
+                            return t;
+                        }
                     }
-                }
-                return '';
+                    return '';
+                })()
             """)
 
             if not clicked:
@@ -207,18 +211,16 @@ def browser_checkin():
             print(f"✅ 已点击按钮: '{clicked}'")
 
             # ===========================================================
-            # 9. 处理可能弹出的 Turnstile
+            # 9. 处理可能弹出的 Turnstile 弹窗
             # ===========================================================
             print("⏳ 等待签到响应…")
             sb.sleep(3)
-            try:
-                sb.uc_gui_click_captcha()
-            except Exception:
-                pass
 
+            # New API 签到可能弹出 Turnstile 弹窗
             for i in range(20):
                 sb.sleep(1)
                 if sb.is_element_present("iframe[src*='challenges.cloudflare.com']"):
+                    print(f"  第 {i+1} 次检测到 Turnstile 弹窗，尝试点击…")
                     try:
                         sb.uc_gui_click_captcha()
                     except Exception:
@@ -227,15 +229,17 @@ def browser_checkin():
             sb.sleep(4)
 
             # ===========================================================
-            # 10. 读取页面提示
+            # 10. 读取页面提示（使用 IIFE）
             # ===========================================================
             print("📢 读取页面提示…")
             toast = sb.execute_script("""
-                const sels = '[class*="toast"], [class*="alert"], [class*="message"], [role="alert"], [class*="notification"], .Toastify__toast, [class*="Message"], [class*="Notice"]';
-                const texts = Array.from(document.querySelectorAll(sels))
-                    .map(t => (t.textContent || '').trim())
-                    .filter(Boolean);
-                return JSON.stringify(texts);
+                (function() {
+                    const sels = '[class*="toast"], [class*="alert"], [class*="message"], [role="alert"], [class*="notification"], .Toastify__toast, [class*="Message"], [class*="Notice"]';
+                    const texts = Array.from(document.querySelectorAll(sels))
+                        .map(t => (t.textContent || '').trim())
+                        .filter(Boolean);
+                    return JSON.stringify(texts);
+                })()
             """)
             print(f"  页面提示: {toast}")
             result["toast"] = toast
