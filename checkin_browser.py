@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
+"""
+iamhc 纯浏览器自动签到 v9
+- 若按钮是"立即签到" → 点击 → 处理 CF → 读取奖励
+- 若按钮已是"已签到" → 直接读奖励，无需点击
+- 金额提取优先匹配特定的 <p> 标签，避免抓取到累计金额
+"""
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
