@@ -1,10 +1,9 @@
-name: iamhc Daily Checkin
+name: iamhc Daily Checkin (Browser)
 
 on:
   schedule:
-    # 每天 UTC 23:00 运行（即北京时间次日 07:00）
-    - cron: '0 23 * * *'
-  workflow_dispatch: # 支持手动触发
+    - cron: '0 23 * * *'   # UTC 23:00 = 北京时间次日 07:00
+  workflow_dispatch:
 
 jobs:
   checkin:
@@ -15,25 +14,55 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests
+      # ---- 安装系统依赖：Xvfb（虚拟显示）+ Chrome ----
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libxi6 libgconf-2-4 libnss3 libxss1 \
+            libasound2t64 libatk-bridge2.0-0 libgtk-3-0 libgbm1 x11vnc
+          # 安装 Google Chrome（SeleniumBase 会自动下载 Chromedriver）
+          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo dpkg -i /tmp/chrome.deb || sudo apt-get install -f -y
 
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install seleniumbase requests pyvirtualdisplay
+
+      # ---- 运行签到脚本 ----
       - name: Run checkin
         env:
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
+          EMAIL:        ${{ secrets.EMAIL }}
+          PASSWORD:     ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python checkin.py
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+        run: |
+          # 启动 Xvfb 虚拟显示（后台）
+          Xvfb :99 -screen 0 1920x1080x24 &
+          export DISPLAY=:99
+          sleep 2
+          # 用 xvfb-run 再次包裹，确保环境变量生效
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python checkin_browser.py
 
-      - name: clear old run jobs
+      # ---- 上传错误截图（如果脚本失败）----
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: |
+            error_screenshot.png
+          if-no-files-found: ignore
+
+      # ---- 清理旧运行记录 ----
+      - name: Clear old runs
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
