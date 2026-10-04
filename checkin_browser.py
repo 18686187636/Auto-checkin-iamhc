@@ -3,8 +3,7 @@
 
 """
 iamhc 自动签到脚本
-优先使用 COOKIES 环境变量；无效时用浏览器登录（账号密码）兜底。
-登录成功后自动打印 cookie 字符串，方便更新 GitHub Secrets。
+认证优先级：COOKIES（自动刷新 access_token） > 浏览器登录兜底
 """
 
 import os, sys, time, json, requests
@@ -13,6 +12,8 @@ from datetime import datetime, timezone, timedelta
 # ---- 环境变量 ----
 EMAIL        = os.environ.get("EMAIL") or ""
 PASSWORD     = os.environ.get("PASSWORD") or ""
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN") or ""
+USER_ID      = os.environ.get("USER_ID") or ""
 COOKIES      = os.environ.get("COOKIES") or ""
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
@@ -26,10 +27,9 @@ LOGIN_PATH = "/sign-in"
 
 
 # ===========================================================================
-# 工具函数
+# 工具
 # ===========================================================================
 def parse_cookie_string(s):
-    """把 "k1=v1; k2=v2" 解析成 dict"""
     cookies = {}
     for kv in s.split(";"):
         kv = kv.strip()
@@ -39,24 +39,36 @@ def parse_cookie_string(s):
     return cookies
 
 
-def make_api_session(cookies):
-    """构造带 cookie 的 requests.Session"""
-    s = requests.Session()
-    s.headers.update({
+def _common_headers():
+    return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/154.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/console",
-    })
+    }
+
+
+def make_session_with_token(access_token, user_id):
+    s = requests.Session()
+    h = _common_headers()
+    h["Authorization"] = f"Bearer {access_token}"
+    h["New-Api-User"] = str(user_id)
+    s.headers.update(h)
+    return s
+
+
+def make_session_with_cookies(cookies):
+    s = requests.Session()
+    s.headers.update(_common_headers())
     for k, v in cookies.items():
         s.cookies.set(k, v, domain="api.hcnsec.cn")
     return s
 
 
 def get_user_info(session):
-    """获取用户信息，成功返回 dict，失败返回 None"""
     r = session.get(f"{BASE_URL}/api/user/self", timeout=20)
     try:
         d = r.json()
@@ -73,7 +85,6 @@ def get_user_info(session):
 
 
 def checkin(session):
-    """签到"""
     r = session.post(f"{BASE_URL}/api/user/checkin", json={}, timeout=20)
     try:
         return r.json()
@@ -86,76 +97,97 @@ def fmt_usd(v):         return str(round(v))
 
 
 # ===========================================================================
-# 浏览器登录（兜底方案）
+# 用 new_api_refresh cookie 换 access_token（关键新增）
 # ===========================================================================
-def get_cookies_via_browser():
-    """启动真实 Chromium 登录，返回 cookies 字典。失败返回 None。"""
+def refresh_access_token(session):
+    """
+    使用 new_api_refresh cookie 调 /api/user/auth，
+    返回 (access_token, user_id)，失败返回 (None, None)。
+    """
+    endpoints = [
+        f"{BASE_URL}/api/user/auth",
+        f"{BASE_URL}/api/user/refresh",
+        f"{BASE_URL}/api/user/token",
+    ]
+    for url in endpoints:
+        try:
+            r = session.post(url, json={}, timeout=20)
+            print(f"    POST {url} -> HTTP {r.status_code}")
+            if r.status_code == 200:
+                try:
+                    d = r.json()
+                except ValueError:
+                    print(f"      响应非 JSON: {r.text[:150]}")
+                    continue
+                if d.get("success"):
+                    payload = d.get("data") or {}
+                    token = (payload.get("access_token")
+                             or payload.get("token")
+                             or "")
+                    ud = payload.get("user") or {}
+                    uid = (ud.get("id") or ud.get("user_id") or ud.get("uid"))
+                    if not uid and payload.get("id"):
+                        uid = payload.get("id")
+                    if token and uid:
+                        print(f"    ✅ 刷新成功 | token 长度 {len(token)} | USER_ID={uid}")
+                        return token, uid
+                    print(f"      成功但缺少字段: {list(payload.keys())}")
+        except Exception as e:
+            print(f"    {url} 异常: {e}")
+    return None, None
+
+
+# ===========================================================================
+# 浏览器登录（最终兜底）
+# ===========================================================================
+def get_auth_via_browser():
+    """启动浏览器登录，返回 (access_token, user_id, cookies)。"""
     from seleniumbase import SB
 
     print("🚀 启动浏览器（UC 模式）…")
-    cookies = None
-
     with SB(
         uc=True,
         headed=True,
-        xvfb=False,              # 外部 xvfb-run 已提供 DISPLAY
+        xvfb=False,
         incognito=True,
         locale_code="zh-CN",
         window_size="1920,1080",
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
     ) as sb:
         try:
-            # 1. 打开登录页
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
 
-            # 2. 等表单
             print("⏳ 等待登录表单…")
             sb.wait_for_element_visible("input[name='username']", timeout=30)
             sb.wait_for_element_visible("input[name='password']", timeout=10)
             print("✅ 登录表单已加载")
 
-            # 3. 填凭证
             print("✍️ 填写登录凭证…")
             sb.type("input[name='username']", EMAIL)
             sb.sleep(0.5)
             sb.type("input[name='password']", PASSWORD)
             sb.sleep(0.5)
 
-            u = sb.get_value("input[name='username']")
-            p = sb.get_value("input[name='password']")
-            print(f"  用户名: '{u}'  密码长度: {len(p) if p else 0}")
-
-            # 4. 勾选法律同意
             print("☑️ 勾选法律同意复选框…")
             consent = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
             try:
                 sb.wait_for_element_present(consent, timeout=10)
-                checked = sb.get_attribute(consent, "aria-checked")
-                if checked != "true":
+                if sb.get_attribute(consent, "aria-checked") != "true":
                     sb.click(consent)
                     sb.sleep(0.6)
-                    checked = sb.get_attribute(consent, "aria-checked")
-                print(f"  复选框 aria-checked = {checked}")
             except Exception as e:
                 print(f"⚠️ 勾选复选框异常: {e}")
 
-            # 5. 等待 Turnstile 加载
-            print("⏳ 等待 Turnstile 组件加载…")
+            print("⏳ 等待 Turnstile…")
             sb.sleep(5)
-
-            # 6. 自动点击 Turnstile
-            print("🖱️ 尝试自动点击 Turnstile…")
             try:
                 sb.uc_gui_click_captcha()
-                print("✅ uc_gui_click_captcha 执行完成")
             except Exception as e:
                 print(f"⚠️ uc_gui_click_captcha 异常: {e}")
 
-            # 7. 等 token 生成
-            print("⏳ 等待 Turnstile token 生成…")
-            token = ""
+            print("⏳ 等待 Turnstile token…")
             for i in range(60):
                 token = sb.execute_script(
                     'return (document.querySelector(\'[name="cf-turnstile-response"]\') || {}).value || "";'
@@ -164,15 +196,11 @@ def get_cookies_via_browser():
                     print(f"✅ Turnstile token 已生成 | 长度: {len(token)}")
                     break
                 sb.sleep(1)
-            if not token:
-                print("⚠️ 等待 60 秒仍未获取 token，继续尝试提交…")
 
-            # 8. 提交
             print("🖱️ 点击登录按钮…")
             sb.wait_for_element_visible("button[type='submit']", timeout=10)
             sb.click("button[type='submit']")
 
-            # 9. 等待跳转
             print("⏳ 等待登录完成…")
             login_ok = False
             for i in range(30):
@@ -184,81 +212,76 @@ def get_cookies_via_browser():
                     break
             if not login_ok:
                 print("⚠️ 未检测到 URL 变化")
-                try:
-                    sb.save_screenshot("login_failed.png")
-                except Exception:
-                    pass
+                sb.save_screenshot("login_failed.png")
 
-            # 10. 多方式提取 cookies
+            # 提取 cookies
             print("🍪 提取 cookies…")
             cookies = {}
-
-            # 方式 1：Selenium 标准 driver.get_cookies() —— 最可靠
             try:
                 raw = sb.driver.get_cookies()
                 if raw:
                     cookies = {c["name"]: c["value"] for c in raw}
-                    print(f"  方式1 driver.get_cookies: {len(cookies)} 个")
+                    print(f"  driver.get_cookies: {len(cookies)} 个")
             except Exception as e:
-                print(f"  方式1 失败: {e}")
+                print(f"  driver.get_cookies 失败: {e}")
 
-            # 方式 2：SeleniumBase get_all_cookies()
-            if not cookies:
-                try:
-                    raw = sb.get_all_cookies()
-                    if raw:
-                        cookies = {c["name"]: c["value"] for c in raw}
-                        print(f"  方式2 get_all_cookies: {len(cookies)} 个")
-                except Exception as e:
-                    print(f"  方式2 失败: {e}")
-
-            # 方式 3：CDP Network.getAllCookies —— 包含 HttpOnly
             if not cookies:
                 try:
                     raw = sb.execute_cdp_cmd("Network.getAllCookies", {})
                     clist = raw.get("cookies", [])
                     if clist:
                         cookies = {c["name"]: c["value"] for c in clist}
-                        print(f"  方式3 Network.getAllCookies: {len(cookies)} 个")
+                        print(f"  CDP getAllCookies: {len(cookies)} 个")
                 except Exception as e:
-                    print(f"  方式3 失败: {e}")
+                    print(f"  CDP getAllCookies 失败: {e}")
 
-            # 方式 4：CDP Network.getCookies 限定 URL
-            if not cookies:
-                try:
-                    raw = sb.execute_cdp_cmd("Network.getCookies", {"urls": [BASE_URL, LOGIN_URL]})
-                    clist = raw.get("cookies", [])
-                    if clist:
-                        cookies = {c["name"]: c["value"] for c in clist}
-                        print(f"  方式4 Network.getCookies: {len(cookies)} 个")
-                except Exception as e:
-                    print(f"  方式4 失败: {e}")
+            # 从 localStorage 提取 access_token
+            access_token = ""
+            user_id = None
+            try:
+                auth_json = sb.execute_script("""
+                    try {
+                        let userStr = localStorage.getItem('user');
+                        if (userStr) {
+                            const u = JSON.parse(userStr);
+                            if (u && u.access_token) {
+                                return JSON.stringify({
+                                    token: u.access_token,
+                                    uid: u.id || u.user_id || u.uid || null
+                                });
+                            }
+                        }
+                        for (let i = 0; i < localStorage.length; i++) {
+                            const val = localStorage.getItem(localStorage.key(i));
+                            if (val && val.startsWith('eyJ') && val.length > 100) {
+                                return JSON.stringify({token: val, uid: null});
+                            }
+                        }
+                        return '';
+                    } catch(e) { return ''; }
+                """)
+                if auth_json:
+                    d = json.loads(auth_json)
+                    access_token = d.get("token", "")
+                    user_id = d.get("uid")
+            except Exception as e:
+                print(f"  localStorage 提取失败: {e}")
 
-            # 方式 5：document.cookie（只能拿非 HttpOnly）
-            if not cookies:
-                try:
-                    raw = sb.execute_script("return document.cookie")
-                    if raw:
-                        for kv in raw.split(";"):
-                            kv = kv.strip()
-                            if "=" in kv:
-                                k, v = kv.split("=", 1)
-                                cookies[k.strip()] = v.strip()
-                        print(f"  方式5 document.cookie: {len(cookies)} 个")
-                except Exception as e:
-                    print(f"  方式5 失败: {e}")
-
-            # 打印成一行，方便复制到 GitHub Secrets
+            # 打印结果
+            print("\n" + "=" * 70)
             if cookies:
                 cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
-                print("\n" + "=" * 70)
-                print("📋 请把以下内容完整复制到 GitHub Secrets 的 COOKIES 变量：")
+                print("📋 请复制以下内容到 GitHub Secrets 的 COOKIES：")
                 print("=" * 70)
                 print(cookie_str)
+                print("=" * 70)
+            if access_token:
+                print("📋 可选：ACCESS_TOKEN / USER_ID")
+                print(f"ACCESS_TOKEN = {access_token}")
+                print(f"USER_ID      = {user_id}")
                 print("=" * 70 + "\n")
 
-            print(f"✅ 最终提取到 {len(cookies)} 个 cookies: {list(cookies.keys())}")
-            return cookies if cookies else None
+            return access_token, user_id, cookies
 
         except Exception as e:
             print(f"❌ 浏览器自动化异常: {e}")
@@ -266,7 +289,7 @@ def get_cookies_via_browser():
                 sb.save_screenshot("error_screenshot.png")
             except Exception:
                 pass
-            return None
+            return None, None, None
 
 
 # ===========================================================================
@@ -293,37 +316,66 @@ def main():
     session = None
     info = None
 
-    # ---------- 路径 1：优先用 COOKIES 环境变量 ----------
-    if COOKIES:
-        print("🔑 使用环境变量 COOKIES 构造会话…")
+    # ---------- 优先级 1：ACCESS_TOKEN + USER_ID ----------
+    if ACCESS_TOKEN and USER_ID:
+        print(f"🔑 尝试 ACCESS_TOKEN（长度 {len(ACCESS_TOKEN)}）+ USER_ID={USER_ID}")
+        session = make_session_with_token(ACCESS_TOKEN, USER_ID)
+        info = get_user_info(session)
+        if info:
+            print(f"✅ ACCESS_TOKEN 有效 | 用户: {info.get('username', '')}")
+        else:
+            print("⚠️ ACCESS_TOKEN 失效，继续下一路径")
+            session = None
+    else:
+        print("ℹ️ 未配置 ACCESS_TOKEN/USER_ID")
+
+    # ---------- 优先级 2：COOKIES（含自动刷新） ----------
+    if session is None and COOKIES:
+        print("🔑 尝试 COOKIES…")
         cookie_dict = parse_cookie_string(COOKIES)
         print(f"  解析到 {len(cookie_dict)} 个 cookie: {list(cookie_dict.keys())}")
-        session = make_api_session(cookie_dict)
+
+        # 先用 cookies 直接试 /api/user/self
+        session = make_session_with_cookies(cookie_dict)
         info = get_user_info(session)
+
+        # 失败 → 用 new_api_refresh 换 access_token
+        if not info and "new_api_refresh" in cookie_dict:
+            print("  直接调用失败，用 new_api_refresh 刷新 access_token…")
+            token, uid = refresh_access_token(session)
+            if token and uid:
+                session = make_session_with_token(token, uid)
+                info = get_user_info(session)
+
         if info:
             print(f"✅ COOKIES 有效 | 用户: {info.get('username', '')}")
         else:
-            print("⚠️ COOKIES 已失效，将回退到浏览器登录")
+            print("⚠️ COOKIES 已失效，回退浏览器登录")
             session = None
-    else:
-        print("ℹ️ 未配置 COOKIES 环境变量")
 
-    # ---------- 路径 2：浏览器登录兜底 ----------
+    # ---------- 优先级 3：浏览器登录兜底 ----------
     if session is None:
         if not EMAIL or not PASSWORD:
             print("❌ 无法回退：未配置 EMAIL 和 PASSWORD")
+            send_notification("❌ iamhc 所有认证方式失败：COOKIES 已失效且未配置 EMAIL/PASSWORD")
             sys.exit(1)
         print("🌐 回退到浏览器登录…")
-        cookies = get_cookies_via_browser()
-        if not cookies:
-            msg = "❌ iamhc 浏览器登录失败，未获取到 cookies"
-            print(msg)
-            send_notification(msg)
-            sys.exit(1)
-        session = make_api_session(cookies)
-        info = get_user_info(session)
+        access_token, user_id, cookies = get_auth_via_browser()
+
+        if access_token and user_id:
+            session = make_session_with_token(access_token, user_id)
+            info = get_user_info(session)
+
+        if (not info) and cookies:
+            # 尝试用新 cookies 调 refresh
+            s2 = make_session_with_cookies(cookies)
+            token, uid = refresh_access_token(s2)
+            if token and uid:
+                session = make_session_with_token(token, uid)
+                info = get_user_info(session)
+
         if not info:
-            msg = "❌ iamhc 浏览器登录成功但 cookies 无效"
+            msg = "❌ iamhc 所有认证方式均失败"
             print(msg)
             send_notification(msg)
             sys.exit(1)
