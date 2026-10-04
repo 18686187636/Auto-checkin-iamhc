@@ -2,7 +2,7 @@ name: iamhc Daily Checkin
 
 on:
   schedule:
-    - cron: '0 23 * * *'   # UTC 23:00 = 北京时间次日 07:00
+    - cron: '30 2 * * *'   # UTC 2:30 = 北京时间次日 10:30
   workflow_dispatch:
 
 jobs:
