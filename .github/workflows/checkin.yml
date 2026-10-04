@@ -61,9 +61,6 @@ jobs:
         env:
           EMAIL:        ${{ secrets.EMAIL }}
           PASSWORD:     ${{ secrets.PASSWORD }}
-          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          USER_ID:      ${{ secrets.USER_ID }}
-          COOKIES:      ${{ secrets.COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
         run: |
@@ -77,8 +74,10 @@ jobs:
         with:
           name: debug-screenshots
           path: |
-            error_screenshot.png
+            browser_error.png
             login_failed.png
+            no_checkin_button.png
+            checkin_result.png
           if-no-files-found: ignore
 
       - name: Clear old runs
