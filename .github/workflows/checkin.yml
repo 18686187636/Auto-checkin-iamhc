@@ -21,20 +21,41 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ---- 安装系统依赖：Xvfb（虚拟显示）+ Chrome ----
+      # ---- 安装系统依赖：Xvfb + Chrome 运行库 ----
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libxi6 libgconf-2-4 libnss3 libxss1 \
-            libasound2t64 libatk-bridge2.0-0 libgtk-3-0 libgbm1 x11vnc
-          # 安装 Google Chrome（SeleniumBase 会自动下载 Chromedriver）
+          # Ubuntu 24.04 需要的依赖（已移除 libgconf-2-4）
+          sudo apt-get install -y \
+            xvfb \
+            libxi6 \
+            libnss3 \
+            libxss1 \
+            libasound2t64 \
+            libatk-bridge2.0-0 \
+            libatk1.0-0 \
+            libcups2 \
+            libdrm2 \
+            libgbm1 \
+            libgtk-3-0 \
+            libpangocairo-1.0-0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            fonts-liberation \
+            xdg-utils
+
+      - name: Install Google Chrome
+        run: |
           wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i /tmp/chrome.deb || sudo apt-get install -f -y
+          google-chrome --version
 
       - name: Install Python deps
         run: |
           pip install --upgrade pip
-          pip install seleniumbase requests pyvirtualdisplay
+          pip install seleniumbase requests
 
       # ---- 运行签到脚本 ----
       - name: Run checkin
@@ -44,21 +65,15 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
         run: |
-          # 启动 Xvfb 虚拟显示（后台）
-          Xvfb :99 -screen 0 1920x1080x24 &
-          export DISPLAY=:99
-          sleep 2
-          # 用 xvfb-run 再次包裹，确保环境变量生效
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python checkin_browser.py
 
-      # ---- 上传错误截图（如果脚本失败）----
+      # ---- 失败时上传截图方便排查 ----
       - name: Upload debug artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
-          path: |
-            error_screenshot.png
+          path: error_screenshot.png
           if-no-files-found: ignore
 
       # ---- 清理旧运行记录 ----
