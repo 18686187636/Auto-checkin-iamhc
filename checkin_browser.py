@@ -4,7 +4,7 @@
 """
 iamhc 纯浏览器自动签到
 流程：浏览器打开登录页 → 填账号密码 → 勾选同意 → 过 Turnstile → 登录
-     → 打开控制台 → 点"签到"按钮 → 处理 Turnstile 弹窗 → 读取结果
+     → 打开个人资料页 → 点击"立即签到" → 处理 Turnstile 弹窗 → 读取结果
 """
 
 import os, sys, time, json, requests
@@ -20,6 +20,7 @@ TZ_CN = timezone(timedelta(hours=8))
 
 LOGIN_URL  = f"{BASE_URL}/sign-in"
 LOGIN_PATH = "/sign-in"
+PROFILE_URL = f"{BASE_URL}/profile"  # 签到功能位于个人资料页面
 
 
 # ===========================================================================
@@ -152,22 +153,21 @@ def browser_checkin():
             sb.sleep(3)
 
             # ===========================================================
-            # 7. 打开控制台
+            # 7. 打开个人资料页面（签到功能位于此处）
             # ===========================================================
-            print("📄 打开控制台…")
-            for path in ["/console", "/dashboard", "/dashboard/overview"]:
-                try:
-                    sb.open(f"{BASE_URL}{path}")
-                    sb.sleep(3)
-                    cur = sb.get_current_url()
-                    if "sign-in" not in cur and "login" not in cur:
-                        print(f"  已打开: {cur}")
-                        break
-                except Exception as e:
-                    print(f"  {path} 打开异常: {e}")
+            print("📄 打开个人资料页面…")
+            sb.open(PROFILE_URL)
+            sb.sleep(4)  # 等待页面完全加载
+
+            cur = sb.get_current_url()
+            print(f"  当前页面: {cur}")
+            if "sign-in" in cur or "login" in cur:
+                print("❌ 被重定向到登录页，登录状态失效")
+                result["error"] = "登录状态失效"
+                return result
 
             # ===========================================================
-            # 8. 扫描并点击签到按钮（使用 IIFE）
+            # 8. 扫描并点击签到按钮（按钮文字为"立即签到"）
             # ===========================================================
             print("🔍 扫描页面按钮…")
             btns = sb.execute_script("""
@@ -181,16 +181,23 @@ def browser_checkin():
             """)
             print(f"  按钮列表: {btns}")
 
-            print("🖱️ 查找签到按钮…")
+            print("🖱️ 查找并点击签到按钮…")
             clicked = sb.execute_script("""
                 (function() {
-                    const elems = document.querySelectorAll('button, a, [role="button"]');
+                    // 优先通过精确文本匹配"立即签到"
+                    let elems = document.querySelectorAll('button, a, [role="button"]');
                     for (let i = 0; i < elems.length; i++) {
                         const t = (elems[i].textContent || '').trim();
-                        if (t && t.length < 25 &&
-                            (t.includes('签到') || t.includes('Check-in') ||
-                             t.includes('Check in') || t.includes('Checkin') ||
-                             t.includes('Daily'))) {
+                        if (t === '立即签到') {
+                            elems[i].scrollIntoView({block: 'center'});
+                            elems[i].click();
+                            return t;
+                        }
+                    }
+                    // 其次匹配包含"签到"的按钮
+                    for (let i = 0; i < elems.length; i++) {
+                        const t = (elems[i].textContent || '').trim();
+                        if (t.includes('签到')) {
                             elems[i].scrollIntoView({block: 'center'});
                             elems[i].click();
                             return t;
@@ -216,7 +223,7 @@ def browser_checkin():
             print("⏳ 等待签到响应…")
             sb.sleep(3)
 
-            # New API 签到可能弹出 Turnstile 弹窗
+            # 新版 New API 签到可能弹出 Turnstile 弹窗
             for i in range(20):
                 sb.sleep(1)
                 if sb.is_element_present("iframe[src*='challenges.cloudflare.com']"):
@@ -229,7 +236,7 @@ def browser_checkin():
             sb.sleep(4)
 
             # ===========================================================
-            # 10. 读取页面提示（使用 IIFE）
+            # 10. 读取页面提示
             # ===========================================================
             print("📢 读取页面提示…")
             toast = sb.execute_script("""
