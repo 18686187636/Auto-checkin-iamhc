@@ -184,23 +184,27 @@ def browser_checkin():
             # ---------- 打开个人资料页 ----------
             print("📄 打开个人资料页面…")
             sb.open(PROFILE_URL)
-            sb.sleep(4)
+            sb.sleep(6)                     # 延长等待，确保签到模块渲染
             cur = sb.get_current_url()
             print(f"  当前页面: {cur}")
             if "sign-in" in cur or "login" in cur:
                 result["error"] = "登录状态失效"
                 return result
 
-            # ---------- 检测按钮状态 ----------
+            # ---------- 检测按钮状态（增强版）----------
             print("🔍 检测签到按钮状态…")
             btn_info = sb.execute_script("""
                 (function() {
-                    const elems = document.querySelectorAll('button');
+                    // 扩大查找范围：button、a、div、span 等
+                    const allElems = document.querySelectorAll('button, a, div, span');
                     let immediate = null;
                     let done = null;
-                    for (let e of elems) {
+
+                    for (let e of allElems) {
                         const t = (e.textContent || '').trim();
-                        if (t === '立即签到' || t.startsWith('立即签到')) {
+                        if (t.length > 50) continue;          // 忽略长文本容器
+
+                        if (t.includes('立即签到')) {
                             immediate = {el: e, text: t};
                             break;
                         }
@@ -208,6 +212,7 @@ def browser_checkin():
                             done = {el: e, text: t};
                         }
                     }
+
                     if (immediate) {
                         immediate.el.setAttribute('data-checkin-target', '1');
                         return JSON.stringify({state: 'ready', text: immediate.text});
@@ -215,9 +220,23 @@ def browser_checkin():
                     if (done) {
                         return JSON.stringify({state: 'already', text: done.text});
                     }
+
+                    // 未找到时收集所有含“签到”的元素用于诊断
+                    const checkinElems = [];
+                    allElems.forEach(e => {
+                        const t = (e.textContent || '').trim();
+                        if (t.includes('签到') && t.length < 100) {
+                            checkinElems.push({
+                                tag: e.tagName,
+                                text: t,
+                                cls: (e.className || '').substring(0, 80)
+                            });
+                        }
+                    });
                     return JSON.stringify({
                         state: 'not_found',
-                        all_buttons: Array.from(elems)
+                        checkin_elems: checkinElems,
+                        all_button_texts: Array.from(document.querySelectorAll('button'))
                             .map(e => (e.textContent || '').trim())
                             .filter(t => t && t.length < 50)
                     });
@@ -254,9 +273,16 @@ def browser_checkin():
             # ---------- 未找到按钮 ----------
             if state == "not_found":
                 print(f"⚠️ 未找到签到按钮")
-                print(f"  所有按钮: {info.get('all_buttons')}")
+                print(f"  含“签到”的元素: {info.get('checkin_elems')}")
+                print(f"  所有按钮文本: {info.get('all_button_texts')}")
                 result["error"] = "未找到签到按钮"
                 sb.save_screenshot("no_checkin_button.png")
+                try:
+                    with open("no_checkin_button.html", "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                    print("  已保存页面源码到 no_checkin_button.html")
+                except Exception as e:
+                    print(f"  保存源码失败: {e}")
                 return result
 
             # ---------- 执行签到 ----------
@@ -289,10 +315,11 @@ def browser_checkin():
             print("🔍 检查按钮状态…")
             btn_state = sb.execute_script("""
                 (function() {
-                    const elems = document.querySelectorAll('button');
+                    const elems = document.querySelectorAll('button, a, div, span');
                     for (let e of elems) {
                         const t = (e.textContent || '').trim();
-                        if (t.includes('已签到') || t === '立即签到' || t.startsWith('立即签到')) {
+                        if (t.length > 50) continue;
+                        if (t.includes('已签到') || t.includes('立即签到')) {
                             return t;
                         }
                     }
