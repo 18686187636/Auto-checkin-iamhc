@@ -94,6 +94,94 @@ def read_award_amount(sb):
     return award_text, amount
 
 
+def find_checkin_button(sb):
+    """
+    在页面中查找签到按钮。
+    返回 dict: {"state": "ready"/"already"/"not_found", "text": ..., "diag": ...}
+    关键：在多个包含“立即签到”的元素中，选文本最短的（最内层），优先 button 标签。
+    """
+    raw = sb.execute_script("""
+        (function() {
+            const allElems = document.querySelectorAll('button, a, div, span');
+            let bestImmediate = null;   // {el, text, isButton}
+            let bestDone = null;
+
+            for (let e of allElems) {
+                const t = (e.textContent || '').trim();
+                if (t.length > 60) continue;      // 跳过超长容器
+
+                const isBtn = (e.tagName === 'BUTTON');
+
+                if (t.includes('立即签到')) {
+                    // 优先 button；否则选文本最短的
+                    if (!bestImmediate) {
+                        bestImmediate = {el: e, text: t, isButton: isBtn};
+                    } else {
+                        const curBetter =
+                            (isBtn && !bestImmediate.isButton) ||
+                            (isBtn === bestImmediate.isButton && t.length < bestImmediate.text.length);
+                        if (curBetter) {
+                            bestImmediate = {el: e, text: t, isButton: isBtn};
+                        }
+                    }
+                }
+                if (t.includes('已签到')) {
+                    if (!bestDone) {
+                        bestDone = {el: e, text: t, isButton: isBtn};
+                    } else {
+                        const curBetter =
+                            (isBtn && !bestDone.isButton) ||
+                            (isBtn === bestDone.isButton && t.length < bestDone.text.length);
+                        if (curBetter) {
+                            bestDone = {el: e, text: t, isButton: isBtn};
+                        }
+                    }
+                }
+            }
+
+            if (bestImmediate) {
+                // 在真实按钮上打标记；如果是非 button，也要打标记并让点击落在最内层
+                bestImmediate.el.setAttribute('data-checkin-target', '1');
+                return JSON.stringify({
+                    state: 'ready',
+                    text: bestImmediate.text,
+                    tag: bestImmediate.el.tagName,
+                    is_button: bestImmediate.isButton
+                });
+            }
+            if (bestDone) {
+                return JSON.stringify({
+                    state: 'already',
+                    text: bestDone.text,
+                    tag: bestDone.el.tagName
+                });
+            }
+
+            // 诊断信息
+            const checkinElems = [];
+            allElems.forEach(e => {
+                const t = (e.textContent || '').trim();
+                if (t.includes('签到') && t.length < 100) {
+                    checkinElems.push({
+                        tag: e.tagName,
+                        text: t,
+                        cls: (e.className || '').substring(0, 80)
+                    });
+                }
+            });
+            return JSON.stringify({
+                state: 'not_found',
+                checkin_elems: checkinElems
+            });
+        })()
+    """)
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"state": "not_found"}
+
+
 def browser_checkin():
     from seleniumbase import SB
 
@@ -184,70 +272,17 @@ def browser_checkin():
             # ---------- 打开个人资料页 ----------
             print("📄 打开个人资料页面…")
             sb.open(PROFILE_URL)
-            sb.sleep(6)                     # 延长等待，确保签到模块渲染
+            sb.sleep(6)
             cur = sb.get_current_url()
             print(f"  当前页面: {cur}")
             if "sign-in" in cur or "login" in cur:
                 result["error"] = "登录状态失效"
                 return result
 
-            # ---------- 检测按钮状态（增强版）----------
+            # ---------- 检测按钮状态 ----------
             print("🔍 检测签到按钮状态…")
-            btn_info = sb.execute_script("""
-                (function() {
-                    // 扩大查找范围：button、a、div、span 等
-                    const allElems = document.querySelectorAll('button, a, div, span');
-                    let immediate = null;
-                    let done = null;
-
-                    for (let e of allElems) {
-                        const t = (e.textContent || '').trim();
-                        if (t.length > 50) continue;          // 忽略长文本容器
-
-                        if (t.includes('立即签到')) {
-                            immediate = {el: e, text: t};
-                            break;
-                        }
-                        if (t.includes('已签到') && !done) {
-                            done = {el: e, text: t};
-                        }
-                    }
-
-                    if (immediate) {
-                        immediate.el.setAttribute('data-checkin-target', '1');
-                        return JSON.stringify({state: 'ready', text: immediate.text});
-                    }
-                    if (done) {
-                        return JSON.stringify({state: 'already', text: done.text});
-                    }
-
-                    // 未找到时收集所有含“签到”的元素用于诊断
-                    const checkinElems = [];
-                    allElems.forEach(e => {
-                        const t = (e.textContent || '').trim();
-                        if (t.includes('签到') && t.length < 100) {
-                            checkinElems.push({
-                                tag: e.tagName,
-                                text: t,
-                                cls: (e.className || '').substring(0, 80)
-                            });
-                        }
-                    });
-                    return JSON.stringify({
-                        state: 'not_found',
-                        checkin_elems: checkinElems,
-                        all_button_texts: Array.from(document.querySelectorAll('button'))
-                            .map(e => (e.textContent || '').trim())
-                            .filter(t => t && t.length < 50)
-                    });
-                })()
-            """)
-            print(f"  按钮状态: {btn_info}")
-
-            try:
-                info = json.loads(btn_info)
-            except Exception:
-                info = {"state": "not_found"}
+            info = find_checkin_button(sb)
+            print(f"  按钮状态: {json.dumps(info, ensure_ascii=False)}")
 
             state = info.get("state", "not_found")
             result["button_before"] = info.get("text", "")
@@ -274,7 +309,6 @@ def browser_checkin():
             if state == "not_found":
                 print(f"⚠️ 未找到签到按钮")
                 print(f"  含“签到”的元素: {info.get('checkin_elems')}")
-                print(f"  所有按钮文本: {info.get('all_button_texts')}")
                 result["error"] = "未找到签到按钮"
                 sb.save_screenshot("no_checkin_button.png")
                 try:
@@ -287,10 +321,17 @@ def browser_checkin():
 
             # ---------- 执行签到 ----------
             print(f"  ✅ 找到'立即签到'按钮，开始签到…")
-            sb.uc_click("[data-checkin-target='1']", reconnect_time=2)
-            result["checkin_clicked"] = True
-            print("✅ 已点击")
+            print(f"    匹配元素: tag={info.get('tag')} is_button={info.get('is_button')} text='{info.get('text')}'")
 
+            # 首选方式：uc_click
+            try:
+                sb.uc_click("[data-checkin-target='1']", reconnect_time=2)
+                result["checkin_clicked"] = True
+                print("✅ 已点击 (uc_click)")
+            except Exception as e:
+                print(f"  ⚠️ uc_click 异常: {e}")
+
+            # 等待并检查按钮状态是否变化
             print("⏳ 等待 CF 弹窗渲染（3 秒）…")
             sb.sleep(3)
 
@@ -305,6 +346,38 @@ def browser_checkin():
             print("⏳ 等待签到请求完成（15 秒）…")
             sb.sleep(15)
 
+            # 检查按钮是否已变成"已签到"
+            after_info = find_checkin_button(sb)
+            if after_info.get("state") == "ready":
+                # 还是"立即签到"，说明 uc_click 没生效，尝试 JS 直接 click
+                print("  ⚠️ uc_click 后按钮状态未变，尝试 JS 直接 click…")
+                js_clicked = sb.execute_script("""
+                    (function() {
+                        const el = document.querySelector("[data-checkin-target='1']");
+                        if (!el) return false;
+                        // 找到最内层可点击的 button
+                        let target = el;
+                        if (el.tagName !== 'BUTTON') {
+                            const innerBtn = el.querySelector('button');
+                            if (innerBtn) target = innerBtn;
+                        }
+                        target.click();
+                        return true;
+                    })()
+                """)
+                print(f"  JS click 结果: {js_clicked}")
+                result["checkin_clicked"] = True
+
+                print("⏳ 再次等待签到请求完成（12 秒）…")
+                sb.sleep(12)
+
+                # 再试一次 CF
+                try:
+                    sb.uc_gui_click_captcha()
+                except Exception:
+                    pass
+                sb.sleep(5)
+
             # ---------- 读取金额 + 按钮状态 ----------
             print("💰 读取签到奖励金额…")
             award_text, award_amount = read_award_amount(sb)
@@ -313,19 +386,8 @@ def browser_checkin():
             print(f"  金额文字: '{award_text}' | 提取: +¥{award_amount}")
 
             print("🔍 检查按钮状态…")
-            btn_state = sb.execute_script("""
-                (function() {
-                    const elems = document.querySelectorAll('button, a, div, span');
-                    for (let e of elems) {
-                        const t = (e.textContent || '').trim();
-                        if (t.length > 50) continue;
-                        if (t.includes('已签到') || t.includes('立即签到')) {
-                            return t;
-                        }
-                    }
-                    return '';
-                })()
-            """)
+            final_info = find_checkin_button(sb)
+            btn_state = final_info.get("text", "")
             print(f"  按钮文字: '{btn_state}'")
             result["button_after"] = btn_state
 
