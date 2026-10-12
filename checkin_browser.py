@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v18-hcnsec: 等签到按钮出现 + 保存 profile 源码
+# v19-hcnsec: 修复 find_checkin_button 的 NodeList 遍历 + XPath 兜底
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -105,14 +105,16 @@ def list_all_buttons(sb):
     try:
         raw = sb.execute_script("""
             var out = [];
-            document.querySelectorAll('button, [role="button"], input[type="submit"], a').forEach(function(b) {
+            var arr = document.querySelectorAll('button, [role="button"], input[type="submit"], a');
+            for (var i = 0; i < arr.length; i++) {
+                var b = arr[i];
                 var txt = (b.textContent || b.value || b.getAttribute('aria-label') || '').trim();
                 if (txt.length > 60) txt = txt.slice(0, 60) + '...';
                 out.push({ tag: b.tagName, type: b.getAttribute('type') || '',
                     text: txt,
                     disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
                     visible: !!(b.offsetWidth || b.offsetHeight) });
-            });
+            }
             return JSON.stringify(out);
         """)
         return json.loads(raw) if raw else []
@@ -187,55 +189,91 @@ def read_award_amount(sb):
 
 
 def find_checkin_button(sb):
+    """★ v19: 改用传统 for 循环遍历 NodeList，避免 for...of 兼容问题"""
     raw = sb.execute_script("""
         (function() {
-            const allElems = document.querySelectorAll('button, a, div, span');
-            let bestImmediate = null;
-            let bestDone = null;
-            for (let e of allElems) {
-                const t = (e.textContent || '').trim();
+            var arr = document.querySelectorAll('button, a, div, span');
+            var bestImmediate = null;
+            var bestDone = null;
+
+            for (var i = 0; i < arr.length; i++) {
+                var e = arr[i];
+                var t = (e.textContent || '').trim();
                 if (t.length > 60) continue;
-                const isBtn = (e.tagName === 'BUTTON');
-                if (t.includes('立即签到')) {
-                    if (!bestImmediate) { bestImmediate = {el: e, text: t, isButton: isBtn}; }
-                    else {
-                        const cb = (isBtn && !bestImmediate.isButton) ||
+
+                var isBtn = (e.tagName === 'BUTTON');
+
+                if (t.indexOf('立即签到') >= 0) {
+                    if (bestImmediate === null) {
+                        bestImmediate = {el: e, text: t, isButton: isBtn};
+                    } else {
+                        var cb = (isBtn && !bestImmediate.isButton) ||
                             (isBtn === bestImmediate.isButton && t.length < bestImmediate.text.length);
                         if (cb) bestImmediate = {el: e, text: t, isButton: isBtn};
                     }
                 }
-                if (t.includes('已签到')) {
-                    if (!bestDone) { bestDone = {el: e, text: t, isButton: isBtn}; }
-                    else {
-                        const cb = (isBtn && !bestDone.isButton) ||
+                if (t.indexOf('已签到') >= 0) {
+                    if (bestDone === null) {
+                        bestDone = {el: e, text: t, isButton: isBtn};
+                    } else {
+                        var cb2 = (isBtn && !bestDone.isButton) ||
                             (isBtn === bestDone.isButton && t.length < bestDone.text.length);
-                        if (cb) bestDone = {el: e, text: t, isButton: isBtn};
+                        if (cb2) bestDone = {el: e, text: t, isButton: isBtn};
                     }
                 }
             }
-            if (bestImmediate) {
+
+            if (bestImmediate !== null) {
                 bestImmediate.el.setAttribute('data-checkin-target', '1');
                 return JSON.stringify({ state: 'ready', text: bestImmediate.text,
                     tag: bestImmediate.el.tagName, is_button: bestImmediate.isButton });
             }
-            if (bestDone) {
+            if (bestDone !== null) {
                 return JSON.stringify({ state: 'already', text: bestDone.text,
                     tag: bestDone.el.tagName });
             }
             return JSON.stringify({ state: 'not_found', checkin_elems: [] });
         })()
     """)
-    try: return json.loads(raw)
-    except Exception: return {"state": "not_found"}
+    # ★ 打印 raw 便于诊断
+    print(f"    [debug find_checkin_button raw]: {str(raw)[:200]}")
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        print(f"    [debug json 解析失败]: {e}")
+        return {"state": "not_found"}
+
+
+def click_checkin_xpath(sb):
+    """★ v19: XPath 直接点击兜底"""
+    xpaths = [
+        "//button[normalize-space(text())='立即签到']",
+        "//button[contains(text(), '立即签到')]",
+        "//*[normalize-space(text())='立即签到']",
+    ]
+    for xp in xpaths:
+        try:
+            els = sb.find_elements(xp)
+            for el in els:
+                try:
+                    if not el.is_displayed(): continue
+                    if not el.is_enabled(): continue
+                    el.click()
+                    print(f"    ✅ XPath 点击成功: {xp}")
+                    return True
+                except Exception as e:
+                    print(f"    XPath {xp} 点击异常: {str(e)[:100]}")
+                    continue
+        except Exception:
+            continue
+    return False
 
 
 def wait_for_checkin_button(sb, max_wait=40):
-    """★ 等待签到按钮出现（处理 SPA 惰性渲染）"""
     print(f"🔍 等待签到按钮出现（最多 {max_wait}s）…")
     info = {"state": "not_found"}
     for i in range(max_wait // 2):
         sb.sleep(2)
-        # 检查页面是否被劫持
         cur = sb.get_current_url()
         if "hcnsec" not in cur:
             print(f"  ❌ 页面被劫持到: {cur}")
@@ -246,14 +284,12 @@ def wait_for_checkin_button(sb, max_wait=40):
         if st != "not_found":
             print(f"  ✅ 第 {i*2}s 找到按钮: state={st} text='{info.get('text','')}'")
             return info
-        # 每 10s 打印一次诊断
         if i % 5 == 4:
             try:
                 body_len = sb.execute_script("return (document.body.innerText || '').length;")
                 btn_count = sb.execute_script("return document.querySelectorAll('button').length;")
-                iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
-                has_text = sb.execute_script("return document.body.innerText.indexOf('签到') >= 0;")
-                print(f"    {i*2}s: 文本长度={body_len}, 按钮数={btn_count}, iframe={iframe_count}, 含'签到'={has_text}")
+                has_text = sb.execute_script("return document.body.innerText.indexOf('立即签到') >= 0;")
+                print(f"    {i*2}s: 文本={body_len}, 按钮={btn_count}, 含'立即签到'={has_text}")
             except Exception as e:
                 print(f"    诊断异常: {e}")
 
@@ -306,7 +342,7 @@ def browser_checkin():
 
             print(f"  当前 URL: {sb.get_current_url()}")
 
-            # 等 Turnstile 初始化
+            # 等 Turnstile
             print("\n⏳ 等待 Turnstile api.js 初始化…")
             for i in range(15):
                 st = get_turnstile_state(sb)
@@ -363,8 +399,6 @@ def browser_checkin():
                 print(f"  ✅ 按钮可用: '{login_text}'")
             else:
                 print("  ⚠️ 按钮 disabled（Turnstile token 未就绪）")
-                for j, b in enumerate(list_all_buttons(sb)):
-                    print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']}")
 
             st = get_turnstile_state(sb)
             print(f"\n🔍 Turnstile 状态: {json.dumps(st, ensure_ascii=False)}")
@@ -415,14 +449,6 @@ def browser_checkin():
                     pass
                 result["error"] = "Turnstile token 未出现"
                 return result
-
-            # 检查按钮
-            print("\n🔍 检查按钮状态…")
-            login_sel, login_text = find_login_button(sb)
-            if login_sel:
-                print(f"  ✅ 按钮可用: '{login_text}'")
-            else:
-                print("  ⚠️ 按钮仍 disabled，强点")
 
             # 点登录
             print("\n🖱️ 点击登录按钮…")
@@ -486,7 +512,7 @@ def browser_checkin():
 
             print(f"  当前页面: {cur}")
 
-            # ★★★ 保存 profile 页源码（诊断用）
+            # 保存 profile 页源码
             try:
                 with open("profile_page.html", "w", encoding="utf-8") as f:
                     f.write(sb.get_page_source())
@@ -494,10 +520,9 @@ def browser_checkin():
             except Exception as e:
                 print(f"  保存源码失败: {e}")
 
-            # ★★★ 等签到按钮出现
+            # 等签到按钮
             info = wait_for_checkin_button(sb, max_wait=40)
 
-            # 如果是被劫持
             if info.get("hijacked"):
                 result["error"] = f"等待按钮时被劫持: {info['hijacked'][:80]}"
                 return result
@@ -520,37 +545,32 @@ def browser_checkin():
                 except Exception: pass
                 return result
 
-            # 未找到
+            # 未找到 - 打印诊断
             if state == "not_found":
                 print("❌ 未找到签到按钮")
-                # 列出所有按钮
                 print("  所有按钮:")
                 for j, b in enumerate(list_all_buttons(sb)):
-                    print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']} visible={b['visible']}")
-                # 检查是否有 iframe
-                try:
-                    iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
-                    print(f"  iframe 数量: {iframe_count}")
-                    # 列 iframe src
-                    srcs = sb.execute_script("""
-                        var out = [];
-                        document.querySelectorAll('iframe').forEach(function(f) {
-                            out.push((f.src || '').slice(0, 200));
-                        });
-                        return out;
-                    """)
-                    for s in (srcs or []):
-                        print(f"    iframe: {s}")
-                except Exception:
-                    pass
-                # 检查页面文本
-                try:
-                    body_text = sb.execute_script("return (document.body.innerText || '').slice(0, 2000);")
-                    print(f"  页面文本前 2000 字: {body_text[:500]}")
-                except Exception:
-                    pass
-                sb.save_screenshot("no_checkin_button.png")
+                    print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']}")
+
+                # ★ 用 XPath 兜底试试
+                print("\n🔧 XPath 兜底查找…")
+                if click_checkin_xpath(sb):
+                    print("✅ XPath 点击成功")
+                    result["checkin_clicked"] = True
+                    sb.sleep(15)
+                    award_text, award_amount = read_award_amount(sb)
+                    result["award_text"] = award_text
+                    result["award_amount"] = award_amount
+                    final_info = find_checkin_button(sb)
+                    result["button_after"] = final_info.get("text", "")
+                    print(f"  金额文字: '{award_text}' | 提取: +¥{award_amount}")
+                    print(f"  按钮文字: '{result['button_after']}'")
+                    try: sb.save_screenshot("checkin_result.png")
+                    except Exception: pass
+                    return result
+
                 result["error"] = "未找到签到按钮"
+                sb.save_screenshot("no_checkin_button.png")
                 return result
 
             # ready - 执行签到
@@ -567,16 +587,18 @@ def browser_checkin():
                 pass
 
             # JS 原生 click
-            sb.execute_script("""
+            clicked = sb.execute_script("""
                 var el = document.querySelector("[data-checkin-target='1']");
-                if (!el) return false;
+                if (!el) return 'NO_TARGET';
                 var t = el;
                 if (el.tagName !== 'BUTTON') {
                     var b = el.querySelector('button');
                     if (b) t = b;
                 }
                 t.click();
+                return 'CLICKED:' + (t.textContent || '').slice(0, 30);
             """)
+            print(f"  JS click 结果: {clicked}")
             result["checkin_clicked"] = True
             print("✅ 已点击签到")
             sb.sleep(15)
