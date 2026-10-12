@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v24-hcnsec: 捕获签到请求响应 + 签到 Turnstile 处理
+# v25-hcnsec: 主动渲染签到 Turnstile 获取 token
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -90,114 +90,152 @@ def get_turnstile_state(sb):
 
 
 # ============================================================
-# ★★★ v24: 请求拦截器（页面加载后注入）
+# ★★★ v25: 主动渲染签到 Turnstile
 # ============================================================
 
-INJECT_INTERCEPTOR = r"""
-(function() {
-    if (window.__cap) return 'ALREADY';
-
-    window.__cap = { requests: [] };
-
-    // ---- XHR ----
-    try {
-        var _open = XMLHttpRequest.prototype.open;
-        var _send = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function(method, url) {
-            this.__cap_url = String(url);
-            this.__cap_method = method;
-            return _open.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function(body) {
-            var self = this;
-            var t0 = Date.now();
-            var bodyStr = body ? String(body).slice(0, 500) : '';
-            var entry = {
-                method: self.__cap_method,
-                url: self.__cap_url,
-                body: bodyStr,
-                ts: t0
-            };
-            window.__cap.requests.push(entry);
-            self.addEventListener('load', function() {
-                entry.status = self.status;
-                entry.duration = Date.now() - t0;
-                try { entry.response = (self.responseText || '').slice(0, 2000); } catch(e) {}
-            });
-            return _send.apply(this, arguments);
-        };
-    } catch(e) {}
-
-    // ---- fetch ----
-    try {
-        var _origFetch = window.fetch;
-        window.fetch = function() {
-            var args = arguments;
-            var url = String(args[0]);
-            var opts = args[1] || {};
-            var method = (opts.method || 'GET').toUpperCase();
-            var bodyStr = opts.body ? String(opts.body).slice(0, 500) : '';
-            var t0 = Date.now();
-            var entry = { method: method, url: url, body: bodyStr, ts: t0 };
-            window.__cap.requests.push(entry);
-            return _origFetch.apply(this, args).then(function(resp) {
-                entry.status = resp.status;
-                entry.duration = Date.now() - t0;
-                try {
-                    resp.clone().text().then(function(txt) {
-                        entry.response = txt.slice(0, 2000);
-                    }).catch(function(){});
-                } catch(e) {}
-                return resp;
-            });
-        };
-    } catch(e) {}
-
-    return 'OK';
-})();
-"""
-
-
-def inject_interceptor(sb):
+def extract_sitekey(sb):
+    """从网络请求里提取 sitekey"""
     try:
-        r = sb.execute_script(INJECT_INTERCEPTOR)
-        print(f"    拦截器注入: {r}")
-        return r == "OK" or r == "ALREADY"
+        sk = sb.execute_script(r"""
+            var urls = performance.getEntriesByType('resource');
+            for (var i = 0; i < urls.length; i++) {
+                var m = urls[i].name.match(/\/(0x[A-Za-z0-9_-]{10,})\//);
+                if (m) return m[1];
+            }
+            return '';
+        """)
+        return sk or ""
+    except Exception:
+        return ""
+
+
+def ensure_turnstile_token(sb):
+    """主动渲染 Turnstile widget 并获取 token"""
+    # 1. 检查当前是否已有 token
+    try:
+        tk_len = sb.execute_script("""
+            var el = document.querySelector('[name="cf-turnstile-response"]');
+            return el ? (el.value || '').length : 0;
+        """)
+        if tk_len and tk_len > 20:
+            print(f"    已有 token 长度={tk_len}")
+            return True
+    except Exception:
+        pass
+
+    # 2. 提取 sitekey
+    sitekey = extract_sitekey(sb)
+    if not sitekey:
+        print("    ❌ 无法提取 sitekey")
+        return False
+    print(f"    sitekey={sitekey}")
+
+    # 3. 主动渲染
+    print("    主动渲染 Turnstile widget…")
+    try:
+        r = sb.execute_script("""
+            var sk = arguments[0];
+            var old = document.getElementById('__checkin_ts_container');
+            if (old) old.remove();
+            var div = document.createElement('div');
+            div.id = '__checkin_ts_container';
+            div.style.cssText = 'position: fixed; top: 100px; right: 100px; z-index: 999999; background: white; padding: 8px; border: 2px solid red;';
+            document.body.appendChild(div);
+            window.__checkin_token = '';
+            try {
+                var widgetId = window.turnstile.render('#__checkin_ts_container', {
+                    sitekey: sk,
+                    callback: function(t) {
+                        window.__checkin_token = t;
+                        console.log('CHECKIN_TOKEN_READY:' + t.length);
+                    },
+                    'error-callback': function(e) {
+                        window.__checkin_token = 'ERR:' + e;
+                    }
+                });
+                return 'RENDERED:' + widgetId;
+            } catch(e) {
+                return 'ERR:' + e.message;
+            }
+        """, sitekey)
+        print(f"    渲染结果: {r}")
     except Exception as e:
-        print(f"    拦截器注入失败: {e}")
+        print(f"    渲染异常: {e}")
         return False
 
+    # 4. 等 token
+    print("    等待 token（最多 40s）…")
+    for i in range(40):
+        sb.sleep(1)
+        try:
+            tok_info = sb.execute_script("""
+                var tk = window.__checkin_token || '';
+                var iframes = document.querySelectorAll('#__checkin_ts_container iframe');
+                return JSON.stringify({
+                    len: tk.length,
+                    err: tk.indexOf('ERR:') === 0 ? tk : '',
+                    iframes: iframes.length
+                });
+            """)
+            d = json.loads(tok_info) if tok_info else {}
+            if d.get("len", 0) > 20:
+                print(f"    ✅ token 就绪！长度={d['len']} iframes={d['iframes']}")
+                # 把 token 塞进隐藏 input
+                try:
+                    sb.execute_script("""
+                        var token = window.__checkin_token;
+                        var el = document.querySelector('[name="cf-turnstile-response"]');
+                        if (!el) {
+                            el = document.createElement('input');
+                            el.type = 'hidden';
+                            el.name = 'cf-turnstile-response';
+                            el.id = '__checkin_ts_input';
+                            document.body.appendChild(el);
+                        }
+                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(el, token);
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    """)
+                    print(f"    ✅ token 已写入 input")
+                except Exception as e:
+                    print(f"    写入 input 异常: {e}")
+                return True
+            if d.get("err"):
+                print(f"    ⚠️ widget 报错: {d['err'][:100]}")
+                return False
+            if i % 10 == 9:
+                print(f"    ⏳ {i+1}s: iframes={d.get('iframes')} token_len={d.get('len')}")
+        except Exception as e:
+            print(f"    检查异常: {e}")
+    return False
 
-def dump_checkin_requests(sb, label=""):
-    """显示所有 /api/user/checkin 请求的响应"""
-    print(f"\n    📊 签到相关请求 {label}:")
+
+def direct_fetch_checkin(sb, token):
+    """★ 直接用 fetch 调用签到 API（绕过按钮 React 逻辑）"""
+    print("    📮 直接用 fetch 调签到 API…")
     try:
-        cap = sb.execute_script("""
-            if (!window.__cap) return '[]';
-            var out = [];
-            for (var i = 0; i < window.__cap.requests.length; i++) {
-                var r = window.__cap.requests[i];
-                if (r.url && r.url.indexOf('/user/checkin') >= 0) {
-                    out.push(r);
-                }
+        r = sb.execute_script("""
+            var token = arguments[0];
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/user/checkin', false);  // 同步
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.withCredentials = true;
+            try {
+                xhr.send(JSON.stringify({turnstile_token: token}));
+                return JSON.stringify({
+                    status: xhr.status,
+                    body: (xhr.responseText || '').slice(0, 500)
+                });
+            } catch(e) {
+                return 'ERR:' + e.message;
             }
-            return JSON.stringify(out);
-        """)
-        reqs = json.loads(cap) if cap else []
-        if not reqs:
-            print("      (无签到请求)")
-            return
-        for r in reqs:
-            print(f"      ▶️  {r.get('method','?')} {r.get('url','')}")
-            if r.get('body'):
-                print(f"          REQ BODY: {r['body'][:300]}")
-            if 'status' in r:
-                print(f"          STATUS: {r.get('status')} ({r.get('duration','?')}ms)")
-            if r.get('response'):
-                print(f"          RESP: {r['response'][:500]}")
-            print()
+        """, token)
+        print(f"    API 响应: {r}")
+        return r
     except Exception as e:
-        print(f"      dump 异常: {e}")
+        print(f"    fetch 异常: {e}")
+        return None
 
 
 # ============================================================
@@ -305,9 +343,8 @@ def wait_for_checkin_button(sb, max_wait=40):
     return info
 
 
-def click_checkin_button_v2(sb, el):
-    """点击签到按钮（只尝试 2 种方式，避免重复请求）"""
-    # 滚动到可见
+def click_checkin_button(sb):
+    """点击签到按钮"""
     try:
         sb.execute_script("""
             var arr = document.querySelectorAll("button");
@@ -323,9 +360,8 @@ def click_checkin_button_v2(sb, el):
     except Exception:
         pass
 
-    # 策略 1: JS 原生 click
     try:
-        r1 = sb.execute_script("""
+        r = sb.execute_script("""
             var arr = document.querySelectorAll('button');
             for (var i = 0; i < arr.length; i++) {
                 if ((arr[i].textContent || '').trim() === '立即签到') {
@@ -335,95 +371,11 @@ def click_checkin_button_v2(sb, el):
             }
             return 'NOT_FOUND';
         """)
-        print(f"    JS click: {r1}")
-        if r1 == "CLICKED":
-            return "JS_CLICK_OK"
+        print(f"    JS click: {r}")
+        return r == "CLICKED"
     except Exception as e:
         print(f"    JS click 异常: {str(e)[:80]}")
-
-    # 策略 2: 逐层向上派发（React 事件可能挂在父级）
-    try:
-        r3 = sb.execute_script("""
-            var arr = document.querySelectorAll('button');
-            var target = null;
-            for (var i = 0; i < arr.length; i++) {
-                if ((arr[i].textContent || '').trim() === '立即签到') {
-                    target = arr[i]; break;
-                }
-            }
-            if (!target) return 'NOT_FOUND';
-            // 只点击目标，不向上
-            target.click();
-            return 'CLICKED';
-        """)
-        print(f"    链式 click: {r3}")
-        if r3 == "CLICKED":
-            return "CHAIN_OK"
-    except Exception as e:
-        print(f"    链式 click 异常: {str(e)[:80]}")
-
-    return "FAILED"
-
-
-def handle_checkin_turnstile(sb):
-    """处理签到过程中可能出现的 Turnstile 弹窗"""
-    print("    🔐 检查 Turnstile 弹窗…")
-    try:
-        st = sb.execute_script("""
-            var ifr = document.querySelectorAll('iframe[src*="challenges.cloudflare"]');
-            var tk = document.querySelector('[name="cf-turnstile-response"]');
-            return JSON.stringify({
-                iframes: ifr.length,
-                token_len: tk ? (tk.value || '').length : -1
-            });
-        """)
-        d = json.loads(st) if st else {}
-        print(f"      iframes={d.get('iframes')} token_len={d.get('token_len')}")
-
-        if d.get('iframes', 0) > 0 and d.get('token_len', 0) < 20:
-            print("      → 弹窗可见，尝试点击…")
-            for i in range(3):
-                try:
-                    sb.uc_gui_click_captcha()
-                    print(f"        第 {i+1} 次点击")
-                except Exception:
-                    pass
-                sb.sleep(3)
-                st2 = sb.execute_script("""
-                    var tk = document.querySelector('[name="cf-turnstile-response"]');
-                    return tk ? (tk.value || '').length : 0;
-                """)
-                if st2 and st2 > 20:
-                    print(f"      ✅ Token 获得！长度={st2}")
-                    return True
-        elif d.get('token_len', 0) > 20:
-            print("      ✅ 已有 token")
-            return True
-    except Exception as e:
-        print(f"      Turnstile 处理异常: {str(e)[:80]}")
     return False
-
-
-def wait_checkin_result(sb, max_wait=40):
-    print(f"⏳ 等待签到结果（最多 {max_wait}s）…")
-    for i in range(max_wait // 2):
-        sb.sleep(2)
-
-        # 检测 Turnstile 弹窗（签到可能又弹）
-        handle_checkin_turnstile(sb)
-
-        info = find_checkin_state(sb)
-        st = info.get("state", "not_found")
-        txt = info.get("text", "")
-        if st == "already":
-            print(f"  ✅ 第 {i*2}s 签到成功，按钮变为: '{txt}'")
-            return info
-
-        if i % 5 == 4:
-            print(f"  ⏳ {i*2}s: state={st}")
-
-    print(f"  ⚠️ {max_wait}s 内状态未变化")
-    return find_checkin_state(sb)
 
 
 def browser_checkin():
@@ -598,10 +550,6 @@ def browser_checkin():
 
             print(f"  当前页面: {cur}")
 
-            # ★★★ 注入拦截器（页面加载后）
-            print("\n📡 注入请求拦截器…")
-            inject_interceptor(sb)
-
             # 等签到按钮
             info = wait_for_checkin_button(sb, max_wait=40)
             if info.get("hijacked"):
@@ -633,30 +581,58 @@ def browser_checkin():
                 result["error"] = "未找到签到按钮"
                 return result
 
-            # ready - 点击签到
-            print(f"  ✅ 找到'立即签到'按钮，点击…")
-            btn_el = info.get("el")
-            click_result = click_checkin_button_v2(sb, btn_el)
-            result["checkin_clicked"] = True
-            print(f"  ▶️ 点击结果: {click_result}")
+            # ============================================================
+            # ★★★ v25 核心：先获取 Turnstile token，再点击签到
+            # ============================================================
+            print(f"  ✅ 找到'立即签到'按钮")
 
-            # ★ 等 4s 让请求完成
-            print("\n⏳ 等待 4s 让签到请求完成…")
+            # 步骤 1: 主动渲染 Turnstile widget
+            print("\n🎯 步骤 1: 主动渲染签到 Turnstile…")
+            token_ok = ensure_turnstile_token(sb)
+
+            if not token_ok:
+                print("❌ 签到 Turnstile token 获取失败")
+                sb.save_screenshot("checkin_token_failed.png")
+                result["error"] = "签到 Turnstile token 获取失败"
+                return result
+
+            # 步骤 2: 点击签到按钮
+            print("\n🎯 步骤 2: 点击签到按钮…")
+            click_ok = click_checkin_button(sb)
+            result["checkin_clicked"] = True
+            print(f"  点击结果: {click_ok}")
+
+            # 步骤 3: 等 4s 看结果
+            print("\n⏳ 步骤 3: 等待 4s…")
             sb.sleep(4)
 
-            # ★★★ 查看签到请求响应
-            dump_checkin_requests(sb, "（点击后）")
+            # 检查按钮状态
+            new_state = find_checkin_state(sb)
+            st = new_state.get("state", "?")
+            print(f"  按钮状态: {st}")
 
-            # 如果签到也弹 Turnstile，处理它
-            print("\n🔐 检查签到后的 Turnstile 弹窗…")
-            handle_checkin_turnstile(sb)
+            # 如果没变，用 API 直接调用
+            if st != "already":
+                print("\n🎯 步骤 4: 按钮未变，直接用 fetch 调 API…")
+                try:
+                    token = sb.execute_script("return window.__checkin_token || '';")
+                    if token and len(token) > 20:
+                        direct_fetch_checkin(sb, token)
+                        sb.sleep(3)
+                        # 重新加载页面
+                        print("  重新加载 profile 页面…")
+                        safe_goto(sb, PROFILE_URL, tag="profile-reload")
+                        sb.sleep(5)
+                    else:
+                        print("  ⚠️ 无 token 可用")
+                except Exception as e:
+                    print(f"  fetch 异常: {e}")
 
             # 等结果
-            new_state = wait_checkin_result(sb, max_wait=40)
+            print("\n🔍 检查最终状态…")
+            new_state = find_checkin_state(sb)
             result["button_after"] = new_state.get("text", "")
-
-            # 再 dump 一次（如果有二次请求）
-            dump_checkin_requests(sb, "（最终）")
+            print(f"  最终按钮: state={new_state.get('state')} text='{new_state.get('text','')}'")
 
             award_text, award_amount = read_amount_via_xpath(sb)
             result["award_text"] = award_text
