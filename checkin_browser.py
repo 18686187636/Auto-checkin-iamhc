@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v14-hcnsec: 主动渲染 Turnstile + 监听 token + 填表提交
+# v15-hcnsec: 屏蔽 Turnstile 走降级路径 + 抓登录请求看服务端反应
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -57,27 +57,178 @@ def check_url(sb, expected_contains="hcnsec", tag=""):
     return True, cur
 
 
-def extract_sitekey_from_network(sb):
-    """从 Performance entries 里提取 turnstile sitekey"""
-    try:
-        urls = sb.execute_script("""
-            var out = [];
-            performance.getEntriesByType('resource').forEach(function(e) {
-                if (e.name.indexOf('challenge-platform') >= 0 ||
-                    e.name.indexOf('turnstile') >= 0) {
-                    out.push(e.name);
-                }
+# ★★★ 页面加载后注入的 hook（时机：React 已渲染）
+INJECT_HOOK_JS = r"""
+(function() {
+    if (window.__cap) return 'ALREADY';
+
+    window.__cap = { requests: [], console: [], errors: [] };
+
+    // ---- fetch ----
+    try {
+        var _origFetch = window.fetch;
+        window.fetch = function() {
+            var args = arguments;
+            var url = String(args[0]).slice(0, 300);
+            var opts = args[1] || {};
+            var method = (opts.method || 'GET').toUpperCase();
+            var body = opts.body ? String(opts.body).slice(0, 1000) : '';
+            var t0 = Date.now();
+            window.__cap.requests.push({
+                type: 'REQ', ts: t0, url: url, method: method, body: body, api: 'fetch'
             });
-            return out;
-        """) or []
-        for u in urls:
-            m = re.search(r'/(0x[A-Za-z0-9_-]{10,})/', u)
-            if m:
-                return m.group(1), urls
-        return None, urls
+            return _origFetch.apply(this, args).then(function(resp) {
+                var entry = {
+                    type: 'RESP', ts: Date.now(),
+                    url: url, status: resp.status, ok: resp.ok,
+                    duration: Date.now() - t0, api: 'fetch'
+                };
+                window.__cap.requests.push(entry);
+                try {
+                    resp.clone().text().then(function(txt) {
+                        window.__cap.requests.push({
+                            type: 'BODY', ts: Date.now(),
+                            url: url, body: txt.slice(0, 2000)
+                        });
+                    }).catch(function(){});
+                } catch(e) {}
+                return resp;
+            }).catch(function(err) {
+                window.__cap.requests.push({
+                    type: 'ERR', ts: Date.now(), url: url,
+                    error: String(err), api: 'fetch'
+                });
+                throw err;
+            });
+        };
+    } catch(e) {}
+
+    // ---- XHR ----
+    try {
+        var _open = XMLHttpRequest.prototype.open;
+        var _send = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this.__cap_url = String(url).slice(0, 300);
+            this.__cap_method = method;
+            return _open.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function(body) {
+            var self = this;
+            var url = self.__cap_url;
+            var method = self.__cap_method;
+            var bodyStr = body ? String(body).slice(0, 1000) : '';
+            var t0 = Date.now();
+            window.__cap.requests.push({
+                type: 'REQ', ts: t0, url: url, method: method,
+                body: bodyStr, api: 'xhr'
+            });
+            self.addEventListener('load', function() {
+                window.__cap.requests.push({
+                    type: 'RESP', ts: Date.now(), url: url,
+                    status: self.status, duration: Date.now() - t0, api: 'xhr'
+                });
+                try {
+                    window.__cap.requests.push({
+                        type: 'BODY', ts: Date.now(),
+                        url: url, body: (self.responseText || '').slice(0, 2000)
+                    });
+                } catch(e) {}
+            });
+            self.addEventListener('error', function() {
+                window.__cap.requests.push({
+                    type: 'ERR', ts: Date.now(), url: url, api: 'xhr'
+                });
+            });
+            return _send.apply(this, arguments);
+        };
+    } catch(e) {}
+
+    // ---- console ----
+    try {
+        ['log','warn','error','info','debug'].forEach(function(lvl) {
+            var orig = console[lvl];
+            console[lvl] = function() {
+                var s = [];
+                for (var i = 0; i < arguments.length; i++) {
+                    var a = arguments[i];
+                    try { s.push(typeof a === 'string' ? a : JSON.stringify(a)); }
+                    catch(e) { s.push(String(a)); }
+                }
+                window.__cap.console.push({
+                    ts: Date.now(), level: lvl,
+                    text: s.join(' ').slice(0, 500)
+                });
+                return orig.apply(this, arguments);
+            };
+        });
+    } catch(e) {}
+
+    // ---- error ----
+    window.addEventListener('error', function(e) {
+        try {
+            window.__cap.errors.push({
+                ts: Date.now(),
+                msg: String(e.message || '').slice(0, 300),
+                src: String(e.filename || '').slice(0, 200),
+                line: e.lineno || 0
+            });
+        } catch(_) {}
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+        try {
+            window.__cap.errors.push({
+                ts: Date.now(),
+                msg: 'REJECT: ' + String(e.reason).slice(0, 300)
+            });
+        } catch(_) {}
+    });
+
+    return 'OK';
+})();
+"""
+
+
+def dump_captured(sb, label=""):
+    print(f"\n{'='*60}")
+    print(f"📊 捕获数据 {label}")
+    print(f"{'='*60}")
+
+    try:
+        cap = sb.execute_script("return window.__cap ? JSON.stringify(window.__cap) : '{}';")
+        data = json.loads(cap) if cap else {}
     except Exception as e:
-        print(f"  提取异常: {e}")
-        return None, []
+        print(f"  读取失败: {e}")
+        return
+
+    reqs = data.get("requests", [])
+    print(f"\n🌐 网络请求（{len(reqs)} 条）:")
+    for r in reqs:
+        t = r.get("type", "?")
+        url = r.get("url", "")[:180]
+        if t == "REQ":
+            print(f"  ➡️  [{r.get('api','?')}] {r.get('method','?')} {url}")
+            if r.get("body"):
+                print(f"      BODY: {r['body'][:300]}")
+        elif t == "RESP":
+            print(f"  ⬅️  [{r.get('api','?')}] {r.get('status','?')} {url} ({r.get('duration','?')}ms)")
+        elif t == "BODY":
+            print(f"  📄  BODY {url}")
+            print(f"      {r.get('body','')[:500]}")
+        elif t == "ERR":
+            print(f"  ❌  {url} {r.get('error','')}")
+
+    con = data.get("console", [])
+    print(f"\n💬 Console（{len(con)} 条）:")
+    for c in con[-30:]:
+        lvl = c.get("level", "?")
+        txt = c.get("text", "")[:200]
+        mark = "❌" if lvl == "error" else ("⚠️" if lvl == "warn" else "  ")
+        print(f"  {mark} [{lvl}] {txt}")
+
+    errs = data.get("errors", [])
+    print(f"\n⚠️  未捕获错误（{len(errs)} 条）:")
+    for e in errs:
+        print(f"  ❌ {e.get('msg','')} @ {e.get('src','')}:{e.get('line','')}")
 
 
 def list_all_buttons(sb):
@@ -100,7 +251,7 @@ def list_all_buttons(sb):
 
 
 def find_login_button(sb):
-    candidates = ["button[type='submit']", "//button[contains(., '登录')]"]
+    candidates = ["button[type='submit']"]
     exclude_keywords = ("搜索", "Search", "订阅", "Subscribe",
                         "注册", "Sign up", "Register", "Passkey")
     for sel in candidates:
@@ -234,7 +385,7 @@ def browser_checkin():
         try:
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
-            sb.sleep(5)  # 多等一会，让 turnstile 初始化
+            sb.sleep(5)
 
             # 等 React
             print("⏳ 等待 React 渲染完成…")
@@ -253,29 +404,25 @@ def browser_checkin():
 
             print(f"  当前 URL: {sb.get_current_url()}")
 
-            # ★★★ 从网络提取 sitekey
-            print("\n🔍 从网络请求提取 sitekey…")
-            sitekey, turnstile_urls = extract_sitekey_from_network(sb)
-            for u in turnstile_urls:
-                print(f"    {u[:140]}")
-            if sitekey:
-                print(f"  ✅ 提取到 sitekey: {sitekey}")
-            else:
-                print(f"  ⚠️ 未能提取 sitekey")
-
-            # Turnstile 环境
-            print("\n🔬 Turnstile 环境:")
+            # 检查 turnstile 是否被屏蔽
+            print("\n🔬 检查 Turnstile 是否被屏蔽:")
             try:
                 ts = sb.execute_script("""
                     return 'turnstile=' + typeof window.turnstile +
-                        ' | render=' + (window.turnstile ? typeof window.turnstile.render : 'N/A') +
                         ' | cf-turnstile=' + document.querySelectorAll('.cf-turnstile').length +
-                        ' | data-sitekey=' + document.querySelectorAll('[data-sitekey]').length +
-                        ' | token_input=' + (document.querySelector('[name="cf-turnstile-response"]') ? 'EXISTS' : 'NONE');
+                        ' | data-sitekey=' + document.querySelectorAll('[data-sitekey]').length;
                 """)
                 print(f"    {ts}")
             except Exception as e:
-                print(f"    环境检测异常: {e}")
+                print(f"    {e}")
+
+            # ★ 注入 hook（页面已加载完，但点击登录的请求还没发出）
+            print("\n📡 注入请求/console 拦截器…")
+            try:
+                ok_inject = sb.execute_script(INJECT_HOOK_JS)
+                print(f"   {ok_inject}")
+            except Exception as e:
+                print(f"   注入失败: {e}")
 
             # 填表
             print("\n✍️ 填写表单…")
@@ -313,147 +460,40 @@ def browser_checkin():
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
-            # ★★★ 核心：主动渲染 Turnstile
-            print("\n🎯 主动渲染 Turnstile widget…")
-            if not sitekey:
-                print("❌ 无 sitekey，跳过主动渲染")
-                result["error"] = "无 sitekey"
-                return result
-
-            render_ok = sb.execute_script("""
-                (function(sk) {
-                    try {
-                        // 删除所有旧的 turnstile 容器和 input
-                        document.querySelectorAll('.cf-turnstile').forEach(function(e) { e.remove(); });
-                        // 创建一个新的可见容器，插到表单里
-                        var form = document.querySelector('form');
-                        if (!form) return 'NO_FORM';
-                        var div = document.createElement('div');
-                        div.id = 'turnstile-container';
-                        div.className = 'cf-turnstile';
-                        div.setAttribute('data-sitekey', sk);
-                        div.style.cssText = 'margin: 10px 0; min-height: 65px; visibility: visible;';
-                        // 插到 submit 按钮之前
-                        var submitBtn = form.querySelector('button[type="submit"]');
-                        if (submitBtn) {
-                            submitBtn.parentNode.insertBefore(div, submitBtn);
-                        } else {
-                            form.appendChild(div);
-                        }
-
-                        // 全局 callback 记录
-                        window.__turnstile_token = '';
-                        window.__turnstile_error = '';
-
-                        // 调用 render
-                        var widgetId = window.turnstile.render('#turnstile-container', {
-                            sitekey: sk,
-                            callback: function(token) {
-                                window.__turnstile_token = token;
-                                console.log('[Turnstile OK] token length:', token.length);
-                                // 同时写入 input
-                                var input = document.querySelector('[name="cf-turnstile-response"]');
-                                if (input) {
-                                    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                                    setter.call(input, token);
-                                    input.dispatchEvent(new Event('input', {bubbles: true}));
-                                    input.dispatchEvent(new Event('change', {bubbles: true}));
-                                }
-                            },
-                            'error-callback': function(err) {
-                                window.__turnstile_error = String(err);
-                            },
-                            'expired-callback': function() {
-                                window.__turnstile_token = '';
-                            },
-                            theme: 'light',
-                            size: 'normal'
-                        });
-                        return 'RENDERED:' + widgetId;
-                    } catch(e) {
-                        return 'ERR:' + e.message;
-                    }
-                })(arguments[0]);
-            """, sitekey)
-            print(f"  渲染结果: {render_ok}")
-
-            sb.sleep(2)
-            try:
-                sb.save_screenshot("turnstile_rendered.png")
-                print("  📸 turnstile_rendered.png")
-            except Exception:
-                pass
-
-            # ★★★ 等 token 出现
-            print("\n⏳ 等待 Turnstile token…")
-            token_ok = False
-            for i in range(60):
-                sb.sleep(1)
-                try:
-                    info = sb.execute_script("""
-                        return JSON.stringify({
-                            token: (window.__turnstile_token || '').length,
-                            error: window.__turnstile_error || '',
-                            input_val: (function(){
-                                var e = document.querySelector('[name="cf-turnstile-response"]');
-                                return e ? (e.value || '').length : -1;
-                            })(),
-                            iframe_count: document.querySelectorAll('iframe').length,
-                            container_html: (function(){
-                                var c = document.querySelector('#turnstile-container');
-                                return c ? c.innerHTML.slice(0, 200) : 'NONE';
-                            })()
-                        });
-                    """)
-                    d = json.loads(info)
-                    if d.get("token", 0) > 20 or d.get("input_val", 0) > 20:
-                        print(f"  ✅ Token 出现！(callback={d['token']} input={d['input_val']})")
-                        token_ok = True
-                        break
-                    if d.get("error"):
-                        print(f"  ⚠️ Turnstile 报错: {d['error']}")
-                    if i % 10 == 9:
-                        print(f"  ⏳ 等待 {i+1}s，状态: {d}")
-                except Exception as e:
-                    print(f"  token 检查异常: {e}")
-
-            if not token_ok:
-                print("❌ Token 未出现")
-                try:
-                    sb.save_screenshot("turnstile_token_timeout.png")
-                except Exception:
-                    pass
-                result["error"] = "Turnstile token 未出现"
-                return result
-
             # 检查按钮
             print("\n🔍 检查按钮状态…")
-            sb.sleep(1)
             login_sel, login_text = find_login_button(sb)
             if login_sel:
                 print(f"  ✅ 按钮可用: '{login_text}'")
             else:
-                print("  ⚠️ 按钮不可用，尝试强点")
+                print("  ⚠️ 按钮不可用，列出所有按钮:")
                 for j, b in enumerate(list_all_buttons(sb)):
                     print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']}")
 
-            # 点登录
-            print("\n🖱️ 点击登录按钮…")
+            # 点登录前，清空缓冲
+            print("\n🧹 清空捕获缓冲，准备点击登录…")
+            sb.execute_script("if (window.__cap) { window.__cap.requests = []; window.__cap.console = []; window.__cap.errors = []; }")
+
+            # 点击登录
+            print("🖱️ 点击登录按钮…")
             sb.execute_script("""
                 var btn = document.querySelector("button[type='submit']");
                 if (btn) {
-                    btn.disabled = false;
-                    btn.removeAttribute('disabled');
+                    if (btn.disabled) {
+                        btn.disabled = false;
+                        btn.removeAttribute('disabled');
+                        btn.removeAttribute('data-disabled');
+                    }
                     btn.click();
                 }
             """)
-            sb.sleep(3)
+            sb.sleep(10)
 
+            # ★ Dump
+            dump_captured(sb, "（点击登录后）")
+
+            # 检查 URL
             ok, cur = check_url(sb, "hcnsec", tag="after_login_click")
-            if not ok:
-                result["error"] = f"登录后跳到异常域名: {cur[:80]}"
-                return result
-
             print(f"  点击后 URL: {cur}")
 
             # 等跳转
@@ -480,6 +520,7 @@ def browser_checkin():
                         f.write(sb.get_page_source())
                 except Exception:
                     pass
+                dump_captured(sb, "（登录失败时）")
                 result["error"] = "登录失败"
                 return result
 
