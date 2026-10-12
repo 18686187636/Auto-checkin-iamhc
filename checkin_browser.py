@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v11-hcnsec: 多层屏蔽 s0-greate.net + JS 错误捕获 + window.turnstile 检查
+# v12-hcnsec: /etc/hosts 屏蔽 + 深度搜 sitekey + React 原生 fill
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -20,8 +20,6 @@ TZ_CN = timezone(timedelta(hours=8))
 LOGIN_URL  = f"{BASE_URL}/sign-in"
 LOGIN_PATH = "/sign-in"
 PROFILE_URL = f"{BASE_URL}/profile"
-
-BLOCKED_HOST = "s0-greate.net"
 
 
 def _requests_proxies():
@@ -59,57 +57,60 @@ def check_url(sb, expected_contains="hcnsec", tag=""):
     return True, cur
 
 
-def apply_cdp_block(sb):
-    """用 CDP 屏蔽 s0-greate.net（可重复调用）"""
+def search_sitekey(sb):
+    """深度搜索页面里的 turnstile sitekey"""
     try:
-        sb.driver.execute_cdp_cmd("Network.enable", {})
-        sb.driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": [f"*{BLOCKED_HOST}*"]
-        })
-        return True
-    except Exception as e:
-        print(f"   CDP 屏蔽失败: {e}")
-        return False
+        raw = sb.execute_script(r"""
+            var found = [];
 
+            // 1. 搜 HTML 静态内容
+            var html = document.documentElement.outerHTML;
+            var m = html.match(/0x[A-Za-z0-9_-]{15,}/g);
+            if (m) found.push('HTML:' + m.join(','));
 
-def clean_overlays(sb):
-    """移除页面上的广告覆盖层（s0-greate.net 可能注入的透明层）"""
-    try:
-        removed = sb.execute_script("""
-            var removed = 0;
-            var all = document.querySelectorAll('div, iframe, ins, section');
-            for (var i = 0; i < all.length; i++) {
-                var el = all[i];
-                var s = getComputedStyle(el);
-                if (s.position !== 'fixed' && s.position !== 'absolute') continue;
-                var zi = parseInt(s.zIndex) || 0;
-                if (zi < 1000) continue;
-                var r = el.getBoundingClientRect();
-                var area = r.width * r.height;
-                var screenArea = window.innerWidth * window.innerHeight;
-                if (area < screenArea * 0.4) continue;
-                // 不删包含表单元素或 Turnstile 的
-                if (el.querySelector('input, textarea, button[type="submit"], .cf-turnstile, iframe[src*="cloudflare"]')) continue;
-                // 不删我们自己的元素
-                if (el.hasAttribute('data-checkin-target')) continue;
-                el.remove();
-                removed++;
-            }
-            return removed;
+            // 2. 搜 script 标签内容
+            document.querySelectorAll('script').forEach(function(s) {
+                var t = s.textContent || '';
+                var mm = t.match(/0x[A-Za-z0-9_-]{15,}/g);
+                if (mm) found.push('SCRIPT:' + mm.join(','));
+            });
+
+            // 3. 搜 window 对象
+            try {
+                for (var k in window) {
+                    try {
+                        var v = window[k];
+                        if (typeof v === 'string' && v.length > 15 && v.length < 200) {
+                            if (v.indexOf('0x4') === 0 || v.indexOf('0x0') === 0) {
+                                found.push('WINDOW.' + k + '=' + v);
+                            }
+                        }
+                    } catch(e) {}
+                }
+            } catch(e) {}
+
+            // 4. 搜常见 config 变量
+            ['__CONFIG__', 'APP_CONFIG', 'config', '__NEXT_DATA__', 'ENV',
+             'TURNSTILE_SITEKEY', 'turnstileSitekey'].forEach(function(k) {
+                try {
+                    var v = window[k];
+                    if (v) found.push('VAR.' + k + '=' + JSON.stringify(v).slice(0, 200));
+                } catch(e) {}
+            });
+
+            // 5. 搜 meta 标签
+            document.querySelectorAll('meta').forEach(function(m) {
+                var n = m.name || m.getAttribute('property') || '';
+                if (n.toLowerCase().indexOf('turnstile') >= 0) {
+                    found.push('META[' + n + ']=' + m.content);
+                }
+            });
+
+            return found.join('\n');
         """)
-        return removed
+        return raw or ""
     except Exception as e:
-        return -1
-
-
-def get_js_errors(sb):
-    """获取页面注册的 JS 错误"""
-    try:
-        return sb.execute_script("""
-            return (window.__captured_errors || []).join('\\n');
-        """)
-    except Exception:
-        return ""
+        return f"搜索异常: {e}"
 
 
 def list_all_buttons(sb):
@@ -119,13 +120,10 @@ def list_all_buttons(sb):
             document.querySelectorAll('button, [role="button"], input[type="submit"], a').forEach(function(b) {
                 var txt = (b.textContent || b.value || b.getAttribute('aria-label') || '').trim();
                 if (txt.length > 60) txt = txt.slice(0, 60) + '...';
-                out.push({
-                    tag: b.tagName,
-                    type: b.getAttribute('type') || '',
+                out.push({ tag: b.tagName, type: b.getAttribute('type') || '',
                     text: txt,
                     disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
-                    visible: !!(b.offsetWidth || b.offsetHeight)
-                });
+                    visible: !!(b.offsetWidth || b.offsetHeight) });
             });
             return JSON.stringify(out);
         """)
@@ -148,8 +146,7 @@ def find_login_button(sb):
             for el in sb.find_elements(sel):
                 try:
                     if not el.is_displayed(): continue
-                    if not el.is_enabled():
-                        continue
+                    if not el.is_enabled(): continue
                 except Exception:
                     continue
                 txt = (el.text or "").strip()
@@ -263,10 +260,7 @@ def browser_checkin():
     sb_kwargs = dict(
         uc=True, headed=True, xvfb=True, incognito=True,
         locale_code="zh-CN", window_size="1920,1080",
-        chromium_arg=(
-            "--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
-            "--disable-blink-features=AutomationControlled"
-        ),
+        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled",
     )
     if CHROME_PROXY:
         print(f"🌐 浏览器代理: {CHROME_PROXY}")
@@ -276,142 +270,112 @@ def browser_checkin():
 
     with SB(**sb_kwargs) as sb:
         try:
-            # ★ Step 1: 页面前先 CDP 屏蔽 + 注入 JS 错误捕获
-            print("🛡️ 预配置：CDP 屏蔽 + JS 错误捕获注入…")
-            apply_cdp_block(sb)
-            try:
-                sb.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                    "source": """
-                        window.__captured_errors = [];
-                        window.addEventListener('error', function(e) {
-                            try {
-                                window.__captured_errors.push(
-                                    '[ERROR] ' + (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0)
-                                );
-                            } catch(_) {}
-                        });
-                        window.addEventListener('unhandledrejection', function(e) {
-                            try {
-                                window.__captured_errors.push(
-                                    '[REJECT] ' + String(e.reason).slice(0, 200)
-                                );
-                            } catch(_) {}
-                        });
-                    """
-                })
-                print("   ✅ JS 错误捕获已注入")
-            except Exception as e:
-                print(f"   JS 捕获注入失败: {e}")
-
-            # Step 2: 打开页面
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
 
-            # ★ Step 3: 打开后立即再设置 CDP（防 UC reconnect 重置）
-            apply_cdp_block(sb)
-
-            # ★ Step 4: 清除覆盖层
-            print("🧹 清除页面覆盖层…")
-            removed = clean_overlays(sb)
-            print(f"   移除 {removed} 个覆盖层")
-
-            # ---------- 等 React 渲染 ----------
+            # 等 React 渲染
             print("⏳ 等待 React 渲染完成…")
-            react_ready = False
             for i in range(20):
                 ok, cur = check_url(sb, "hcnsec", tag="open")
                 if not ok:
                     result["error"] = f"打开页面被劫持: {cur[:80]}"
                     return result
-                has_user = sb.execute_script(
-                    "return document.querySelector(\"input[name='username']\") ? 1 : 0;"
-                )
-                if has_user:
+                if sb.execute_script("return document.querySelector(\"input[name='username']\") ? 1 : 0;"):
                     print(f"  ✅ React 已渲染 (等待 {i}s)")
-                    react_ready = True
                     break
                 sb.sleep(1)
-                if i % 3 == 2:
-                    clean_overlays(sb)  # 反复清理
-
-            if not react_ready:
+            else:
                 result["error"] = "React 未渲染"
                 return result
 
             print(f"  当前 URL: {sb.get_current_url()}")
 
-            # ---------- ★ 关键诊断 ----------
-            print("🔬 关键诊断…")
-
-            # 1. 网络请求（Performance API）
+            # ---------- ★ 关键诊断 1: s0-greate.net 是否加载 ----------
+            print("\n🔬 诊断 1: 检查 s0-greate.net 网络请求")
             try:
-                actual_requests = sb.execute_script("""
+                reqs = sb.execute_script("""
                     var out = [];
-                    var entries = performance.getEntriesByType('resource');
-                    for (var i = 0; i < entries.length; i++) {
-                        if (entries[i].name.indexOf('s0-greate') >= 0) {
-                            out.push('LEAKED: ' + entries[i].name.slice(0, 120));
-                        }
-                    }
+                    performance.getEntriesByType('resource').forEach(function(e) {
+                        if (e.name.indexOf('s0-greate') >= 0) out.push('LEAKED: ' + e.name.slice(0,120));
+                    });
                     return out.join('\\n');
                 """)
-                if actual_requests:
-                    print(f"  ⚠️ s0-greate.net 仍发出请求:")
-                    for line in actual_requests.split('\n'):
-                        print(f"    {line}")
+                if reqs:
+                    print(f"  ⚠️ s0-greate.net 仍加载:\n    {reqs}")
                 else:
-                    print(f"  ✅ s0-greate.net 未发出请求")
+                    print(f"  ✅ s0-greate.net 未加载（/etc/hosts 屏蔽生效）")
             except Exception as e:
-                print(f"  网络请求诊断异常: {e}")
+                print(f"  诊断异常: {e}")
 
-            # 2. Turnstile 状态
+            # ---------- ★ 关键诊断 2: 搜 sitekey ----------
+            print("\n🔬 诊断 2: 深度搜索 sitekey")
+            sk = search_sitekey(sb)
+            if sk:
+                for line in sk.split('\n'):
+                    print(f"    {line}")
+            else:
+                print("    ⚠️ 未找到任何 sitekey")
+
+            # ---------- ★ 关键诊断 3: Turnstile 环境 ----------
+            print("\n🔬 诊断 3: Turnstile 环境")
             try:
-                ts_info = sb.execute_script("""
+                ts = sb.execute_script("""
                     var out = [];
-                    out.push('window.turnstile=' + (typeof window.turnstile));
-                    out.push('turnstile.render=' + (window.turnstile && typeof window.turnstile.render));
+                    out.push('turnstile=' + typeof window.turnstile);
+                    out.push('turnstile.render=' + (window.turnstile ? typeof window.turnstile.render : 'N/A'));
+                    out.push('turnstile.ready=' + (window.turnstile ? typeof window.turnstile.ready : 'N/A'));
                     out.push('cf-turnstile=' + document.querySelectorAll('.cf-turnstile').length);
                     out.push('data-sitekey=' + document.querySelectorAll('[data-sitekey]').length);
-                    var tk = document.querySelector('[name="cf-turnstile-response"]');
-                    out.push('token_input=' + (tk ? 'EXISTS(len:' + (tk.value||'').length + ')' : 'NONE'));
-                    var iframes = document.querySelectorAll('iframe');
-                    out.push('iframe_count=' + iframes.length);
-                    for (var j=0; j<iframes.length; j++) {
-                        out.push('iframe['+j+']=' + (iframes[j].src||'').slice(0,100));
-                    }
-                    return out.join('\\n');
+                    return out.join(' | ');
                 """)
-                print("  Turnstile 环境:")
-                for line in (ts_info or '').split('\n'):
-                    print(f"    {line}")
+                print(f"    {ts}")
             except Exception as e:
-                print(f"  Turnstile 诊断异常: {e}")
+                print(f"    诊断异常: {e}")
 
-            # 3. JS 错误
-            try:
-                errors = get_js_errors(sb)
-                if errors:
-                    print(f"  ⚠️ 页面 JS 错误:")
-                    for line in errors.split('\n'):
-                        print(f"    {line}")
-                else:
-                    print(f"  ✅ 无 JS 错误")
-            except Exception as e:
-                print(f"  JS 错误诊断异常: {e}")
+            # ---------- 输入凭证（用 JS 原生 fill 触发 React 事件）----------
+            print("\n✍️ 用 React 原生方式填写表单…")
 
-            sb.wait_for_element_visible("input[name='username']", timeout=15)
-            sb.wait_for_element_visible("input[name='password']", timeout=10)
+            def react_fill(name, value):
+                sb.execute_script("""
+                    var el = document.querySelector(`input[name="${arguments[0]}"]`);
+                    if (!el) return false;
+                    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, arguments[1]);
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.dispatchEvent(new Event('blur', {bubbles: true}));
+                    return true;
+                """, [name, value])
 
-            # 输入凭证
-            print("✍️ 填写用户名…")
-            sb.type("input[name='username']", EMAIL)
+            # ★ 注意：execute_script 不支持多参数，改用单参数对象
+            def react_fill2(name, value):
+                payload = json.dumps({"name": name, "value": value})
+                return sb.execute_script("""
+                    var p = JSON.parse(arguments[0]);
+                    var el = document.querySelector("input[name='" + p.name + "']");
+                    if (!el) return false;
+                    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, p.value);
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.dispatchEvent(new Event('blur', {bubbles: true}));
+                    return true;
+                """, payload)
+
+            ok = react_fill2("username", EMAIL)
+            print(f"  username fill: {ok}")
             sb.sleep(0.5)
-            print("✍️ 填写密码…")
-            sb.type("input[name='password']", PASSWORD)
+            ok = react_fill2("password", PASSWORD)
+            print(f"  password fill: {ok}")
             sb.sleep(0.5)
 
-            # 勾选同意
+            ok, cur = check_url(sb, "hcnsec", tag="after_fill")
+            if not ok:
+                result["error"] = f"填表后被劫持: {cur[:80]}"
+                return result
+
+            # ---------- 勾选同意（JS click）----------
             print("☑️ 勾选法律同意…")
             consent_sel = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
             try:
@@ -425,117 +389,60 @@ def browser_checkin():
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
-            ok, cur = check_url(sb, "hcnsec", tag="after_consent")
-            if not ok:
-                result["error"] = f"勾选同意后被劫持: {cur[:80]}"
-                return result
+            # 检查按钮状态
+            print("\n🔍 勾选后立即检查登录按钮状态…")
+            btn_info = sb.execute_script("""
+                var btn = document.querySelector("button[type='submit']");
+                if (!btn) return 'NOT_FOUND';
+                var html = btn.outerHTML.slice(0, 300);
+                return JSON.stringify({
+                    disabled: btn.disabled,
+                    ariaDisabled: btn.getAttribute('aria-disabled'),
+                    innerHTML: html
+                });
+            """)
+            print(f"    {btn_info}")
 
-            # ---------- 尝试主动渲染 Turnstile ----------
-            print("🔧 尝试主动渲染 Turnstile…")
-            try:
-                render_result = sb.execute_script("""
-                    // 找到 sitekey
-                    var containers = document.querySelectorAll('[data-sitekey]');
-                    var sitekey = containers.length > 0 ? containers[0].getAttribute('data-sitekey') : '';
-                    if (!sitekey) {
-                        // 从内联脚本里找
-                        var html = document.body.innerHTML;
-                        var m = html.match(/0x[A-Za-z0-9_-]{15,}/);
-                        if (m) sitekey = m[0];
-                    }
-                    // 从 api.js 加载状态看
-                    var state = {
-                        api_loaded: typeof window.turnstile !== 'undefined',
-                        sitekey: sitekey,
-                        called: false
-                    };
-                    if (state.api_loaded && sitekey) {
-                        try {
-                            window.turnstile.render('[data-sitekey]', {
-                                sitekey: sitekey,
-                                callback: function(token) {
-                                    console.log('[Turnstile OK]', token);
-                                }
-                            });
-                            state.called = true;
-                        } catch(e) { state.error = e.message; }
-                    }
-                    return JSON.stringify(state);
-                """)
-                print(f"   渲染结果: {render_result}")
-            except Exception as e:
-                print(f"   渲染异常: {e}")
-
-            sb.sleep(3)
-
-            # ---------- 等待登录按钮 enabled ----------
-            print("⏳ 等待登录按钮 enabled…")
+            # 等等看按钮是否变 enabled
+            print("⏳ 等待按钮 enabled（最多 30s）…")
             login_sel, login_text = None, None
-            for i in range(20):
+            for i in range(30):
                 sb.sleep(1)
                 login_sel, login_text = find_login_button(sb)
                 if login_sel:
-                    print(f"  ✅ 第 {i}s 按钮已 enabled: '{login_text}'")
+                    print(f"  ✅ 第 {i}s 按钮 enabled: '{login_text}'")
                     break
-                if i % 5 == 4:
-                    # 再清一次覆盖层
-                    r = clean_overlays(sb)
-                    if r > 0:
-                        print(f"    移除 {r} 个覆盖层")
+                if i == 14:
+                    print("  ℹ️ 15s 时再列出所有按钮:")
+                    for j, b in enumerate(list_all_buttons(sb)):
+                        print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']}")
 
             if not login_sel:
-                print("❌ 20s 后按钮仍 disabled")
-                # 列出所有按钮看状态
-                buttons = list_all_buttons(sb)
-                for j, b in enumerate(buttons):
-                    print(f"    [{j}] <{b['tag']}> text='{b['text']}' disabled={b['disabled']}")
+                print("❌ 30s 后按钮仍 disabled")
+                sb.save_screenshot("button_still_disabled.png")
 
-                # 尝试强制调用 React 的 onSubmit
-                print("🔧 尝试直接调用表单 submit…")
+                # 保存关键调试信息
                 try:
-                    submit_result = sb.execute_script("""
-                        var form = document.querySelector('form');
-                        if (form) {
-                            form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
-                            return 'form dispatched';
-                        }
-                        // 找不到 form 就找 submit 按钮强点
-                        var btn = document.querySelector("button[type='submit']");
-                        if (btn) {
-                            btn.removeAttribute('disabled');
-                            btn.disabled = false;
-                            btn.click();
-                            return 'button forced click';
-                        }
-                        return 'NO_FORM_NO_BUTTON';
-                    """)
-                    print(f"   结果: {submit_result}")
-                    sb.sleep(5)
-                    cur = sb.get_current_url()
-                    print(f"   当前 URL: {cur}")
-                    if "hcnsec" in cur and LOGIN_PATH not in cur:
-                        print(f"   ✅ 强制提交成功跳转")
-                        login_sel = "FORCED"
-                except Exception as e:
-                    print(f"   强制提交异常: {e}")
+                    with open("login_page_source.html", "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                    print("  📄 已保存 login_page_source.html")
+                except Exception:
+                    pass
 
-                if not login_sel:
-                    sb.save_screenshot("button_disabled.png")
-                    result["error"] = "登录按钮一直 disabled"
-                    return result
+                result["error"] = "登录按钮一直 disabled"
+                return result
 
             # ---------- 点登录 ----------
-            if login_sel != "FORCED":
-                print("🖱️ 点击登录按钮…")
-                sb.execute_script("""
-                    var btn = document.querySelector("button[type='submit']");
-                    if (btn && !btn.disabled) btn.click();
-                """)
+            print("🖱️ 点击登录按钮…")
+            sb.execute_script("""
+                var btn = document.querySelector("button[type='submit']");
+                if (btn && !btn.disabled) btn.click();
+            """)
             sb.sleep(3)
 
             ok, cur = check_url(sb, "hcnsec", tag="after_login_click")
             if not ok:
-                result["error"] = f"登录按钮点击后跳到异常域名: {cur[:80]}"
+                result["error"] = f"登录后跳到异常域名: {cur[:80]}"
                 return result
 
             print(f"  点击后 URL: {cur}")
@@ -547,7 +454,6 @@ def browser_checkin():
                 sb.sleep(1)
                 cur = sb.get_current_url()
                 if "hcnsec" not in cur:
-                    print(f"❌ 等待过程中跳到异常域名: {cur}")
                     result["error"] = f"等待过程中被劫持: {cur[:80]}"
                     return result
                 if "hcnsec" in cur and LOGIN_PATH not in cur and "/login" not in cur:
@@ -568,10 +474,8 @@ def browser_checkin():
 
             # ---------- 打开 profile ----------
             print("📄 打开个人资料页面…")
-            clean_overlays(sb)  # 先清覆盖层
             sb.open(PROFILE_URL)
             sb.sleep(6)
-            clean_overlays(sb)
             ok, cur = check_url(sb, "hcnsec", tag="profile")
             if not ok:
                 result["error"] = f"打开 profile 跳到异常域名: {cur[:80]}"
