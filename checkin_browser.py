@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v5-hcnsec: 屏蔽 s0-greate.net 广告脚本 + React 渲染等待 + 全程 URL 校验
+# v6-hcnsec: 白名单模式屏蔽第三方 + list 传参修复
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -21,7 +21,16 @@ LOGIN_URL  = f"{BASE_URL}/sign-in"
 LOGIN_PATH = "/sign-in"
 PROFILE_URL = f"{BASE_URL}/profile"
 
-# ★★★ 要屏蔽的广告/追踪域名（host-resolver-rules 会把这些域名解析到 0.0.0.0）
+# ★★★ v6: 白名单模式 —— 只允许这些域名解析，其他全部 MAP 到 0.0.0.0
+ALLOWED_HOSTS = [
+    "api.hcnsec.cn",
+    "*.hcnsec.cn",
+    "*.cloudflare.com",           # Turnstile 需要
+    "cloudflare.com",
+    "api.ipify.org",              # 用于诊断出口 IP
+]
+
+# 额外的黑名单（冗余保险，不会被 host-resolver-rules 拆分影响）
 BLOCKED_DOMAINS = [
     "s0-greate.net",
     "www.googletagmanager.com",
@@ -252,13 +261,19 @@ def browser_checkin():
 
     print("🚀 启动浏览器（UC 模式）…")
 
-    # ★★★ 用 --host-resolver-rules 屏蔽 s0-greate.net 等广告/追踪域名
-    #   把这些域名解析到 0.0.0.0，让脚本加载失败，但不影响页面主体
-    resolver_rules = ",".join(f"MAP {d} 0.0.0.0" for d in BLOCKED_DOMAINS)
-    chromium_args = (
-        "--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
-        f"--host-resolver-rules={resolver_rules}"
-    )
+    # ★★★ v6 关键修复：chromium_arg 用 LIST 传递，逗号不会被切
+    #   白名单模式：MAP * 0.0.0.0 屏蔽所有域名，EXCLUDE 放行必要域名
+    resolver_rules = "MAP * 0.0.0.0"
+    for host in ALLOWED_HOSTS:
+        resolver_rules += f", EXCLUDE {host}"
+
+    chromium_args_list = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-blink-features=AutomationControlled",
+        f"--host-resolver-rules={resolver_rules}",
+    ]
 
     sb_kwargs = dict(
         uc=True,
@@ -267,7 +282,7 @@ def browser_checkin():
         incognito=True,
         locale_code="zh-CN",
         window_size="1920,1080",
-        chromium_arg=chromium_args,
+        chromium_arg=chromium_args_list,   # ★ 用 list，不用逗号字符串
     )
     if CHROME_PROXY:
         print(f"🌐 浏览器代理: {CHROME_PROXY}")
@@ -280,7 +295,8 @@ def browser_checkin():
     else:
         print("🌐 requests 代理: 未启用（直连）")
 
-    print(f"🚫 屏蔽域名: {', '.join(BLOCKED_DOMAINS)}")
+    print(f"🚫 白名单模式：仅放行 {', '.join(ALLOWED_HOSTS)}")
+    print(f"   其他域名全部解析失败（拦截所有广告脚本）")
 
     with SB(**sb_kwargs) as sb:
         try:
@@ -289,7 +305,7 @@ def browser_checkin():
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
 
-            # ★★★ 关键改动：等 React 渲染完成，同时检查是否被劫持
+            # ---------- 等 React 渲染，同时检查是否被劫持 ----------
             print("⏳ 等待 React 渲染完成…")
             react_ready = False
             for i in range(20):
@@ -323,7 +339,6 @@ def browser_checkin():
             print(f"  当前 URL: {sb.get_current_url()}")
             print(f"  页面标题: {sb.get_title()}")
 
-            # ---------- 等待输入框 ----------
             sb.wait_for_element_visible("input[name='username']", timeout=15)
             sb.wait_for_element_visible("input[name='password']", timeout=10)
 
@@ -343,7 +358,7 @@ def browser_checkin():
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
-            # ---------- 保存登录页源码 ----------
+            # 保存源码
             try:
                 with open("login_page_source.html", "w", encoding="utf-8") as f:
                     f.write(sb.get_page_source())
@@ -351,7 +366,7 @@ def browser_checkin():
             except Exception as e:
                 print(f"  保存登录页源码失败: {e}")
 
-            # ---------- 浏览器出口 IP 检测 ----------
+            # ---------- 浏览器出口 IP ----------
             print("🔍 通过浏览器获取出口 IP…")
             try:
                 ip_info = sb.execute_script("""
@@ -414,7 +429,6 @@ def browser_checkin():
 
             turnstile_ok = False
             for i in range(60):
-                # 每次检查都先确认没被劫持
                 cur = sb.get_current_url()
                 if "hcnsec" not in cur:
                     print(f"❌ Turnstile 等待中被劫持到: {cur}")
@@ -599,7 +613,6 @@ def browser_checkin():
                     print(f"  保存源码失败: {e}")
                 return result
 
-            # ---------- 执行签到 ----------
             print(f"  ✅ 找到'立即签到'按钮，开始签到…")
             print(f"    匹配元素: tag={info.get('tag')} is_button={info.get('is_button')} text='{info.get('text')}'")
 
