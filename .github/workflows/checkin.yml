@@ -19,16 +19,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install seleniumbase requests
-          # SeleniumBase 的 UC 模式需要 chromedriver，会自动下载
+          pip install -r requirements.txt
 
       # ============================================================
-      # sing-box 代理（用户提供）
+      # ★ Xvfb：给 headed Chrome 提供虚拟显示
+      # ============================================================
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      # ============================================================
+      # sing-box 代理
       # ============================================================
       - name: Configure sing-box proxy
         id: singbox
@@ -125,7 +132,7 @@ jobs:
           fi
 
       # ============================================================
-      # 验证代理出口 IP（诊断用）
+      # 诊断：出口 IP
       # ============================================================
       - name: Check proxy exit IP
         if: steps.singbox.outputs.proxy_ready == 'true'
@@ -146,8 +153,6 @@ jobs:
           PASSWORD:     ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-
-          # ★ 代理：Chromium 走 socks5，requests 走 http
           CHROME_PROXY: socks5://127.0.0.1:1080
           HTTPS_PROXY:  http://127.0.0.1:1081
         run: |
