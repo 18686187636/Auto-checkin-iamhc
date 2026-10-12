@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v20-hcnsec: 弃用 execute_script 检测按钮，全用 Selenium XPath
+# v21-hcnsec: uc_click 真实点击签到 + 检测结果变化
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -90,12 +90,11 @@ def get_turnstile_state(sb):
 
 
 # ============================================================
-# ★★★ 全部用 Selenium XPath API（不用 execute_script）
+# 全部用 Selenium XPath API
 # ============================================================
 
 def find_checkin_state(sb):
     """用 Selenium XPath 检测签到按钮状态"""
-    # 优先找"立即签到"
     try:
         els = sb.find_elements("//button[normalize-space(text())='立即签到']")
         for el in els:
@@ -107,7 +106,6 @@ def find_checkin_state(sb):
     except Exception:
         pass
 
-    # 也检查包含"立即签到"的按钮（可能是 span 里）
     try:
         els = sb.find_elements("//button[contains(., '立即签到')]")
         for el in els:
@@ -119,7 +117,6 @@ def find_checkin_state(sb):
     except Exception:
         pass
 
-    # 检查"已签到"
     try:
         els = sb.find_elements("//button[contains(., '已签到')]")
         for el in els:
@@ -137,7 +134,6 @@ def find_checkin_state(sb):
 def read_amount_via_xpath(sb):
     """用 XPath 读'今天 +¥X.XX'金额"""
     try:
-        # 尝试多个 xpath
         xpaths = [
             "//p[contains(text(), '今天') and contains(text(), '¥')]",
             "//*[contains(text(), '今天') and contains(text(), '¥') and string-length(text()) < 50]",
@@ -155,7 +151,6 @@ def read_amount_via_xpath(sb):
     except Exception:
         pass
 
-    # 尝试从整个 body 里正则提取
     try:
         body_text = sb.get_text("body")
         m = re.search(r'今天\s*[+＋]\s*¥\s*([\d.]+)', body_text)
@@ -168,7 +163,6 @@ def read_amount_via_xpath(sb):
 
 
 def list_all_buttons_safe(sb):
-    """用 Selenium API 列出按钮（少量，避免 execute_script 超时）"""
     out = []
     try:
         els = sb.find_elements("//button")
@@ -210,35 +204,107 @@ def wait_for_checkin_button(sb, max_wait=40):
     return info
 
 
-def click_checkin_button(sb, el):
-    """三级点击：XPath element.click → JS click → XPath 重新查找"""
-    # 1. element.click()
-    try:
-        el.click()
-        print("    ✅ element.click() 成功")
-        return True
-    except Exception as e:
-        print(f"    ⚠️ element.click() 失败: {str(e)[:100]}")
+# ============================================================
+# ★★★ v21: 用真实鼠标点击（uc_click）
+# ============================================================
 
-    # 2. JS click
+def click_checkin_button(sb, el):
+    """★ v21: 用 SeleniumBase uc_click 真实鼠标点击（React 才响应）"""
+
+    # 先滚动到可见
     try:
         sb.execute_script("""
             var arr = document.querySelectorAll("button");
             for (var i = 0; i < arr.length; i++) {
-                var t = (arr[i].textContent || '').trim();
-                if (t === '立即签到') {
-                    arr[i].click();
-                    return 'OK';
+                if ((arr[i].textContent || '').trim() === '立即签到') {
+                    arr[i].scrollIntoView({block: 'center', behavior: 'instant'});
+                    return 'SCROLLED';
                 }
             }
             return 'NOT_FOUND';
         """)
-        print("    ✅ JS click 成功")
+        sb.sleep(1)
+    except Exception:
+        pass
+
+    # 策略 1: uc_click（SeleniumBase 反检测真实点击）
+    click_selectors = [
+        "//button[normalize-space(text())='立即签到']",
+        "//button[contains(., '立即签到')]",
+    ]
+    for sel in click_selectors:
+        try:
+            sb.uc_click(sel, timeout=5)
+            print(f"    ✅ uc_click 成功: {sel}")
+            return True
+        except Exception as e:
+            print(f"    ⚠️ uc_click {sel[:40]} 失败: {str(e)[:80]}")
+
+    # 策略 2: SeleniumBase 原生 click_xpath
+    for sel in click_selectors:
+        try:
+            sb.click_xpath(sel)
+            print(f"    ✅ click_xpath 成功: {sel}")
+            return True
+        except Exception as e:
+            print(f"    ⚠️ click_xpath {sel[:40]} 失败: {str(e)[:80]}")
+
+    # 策略 3: 坐标点击
+    try:
+        target = sb.find_element("//button[normalize-space(text())='立即签到']")
+        loc = target.location
+        size = target.size
+        x = loc["x"] + size["width"] / 2
+        y = loc["y"] + size["height"] / 2
+        print(f"    坐标点击: ({x:.0f}, {y:.0f})")
+        sb.uc_gui_click_x_y(x, y)
+        print(f"    ✅ 坐标点击成功")
         return True
     except Exception as e:
-        print(f"    ⚠️ JS click 失败: {str(e)[:100]}")
+        print(f"    ⚠️ 坐标点击失败: {str(e)[:80]}")
 
     return False
+
+
+def wait_checkin_result(sb, max_wait=40):
+    """★ v21: 等按钮状态变化，或检测 Turnstile 弹窗"""
+    print(f"⏳ 等待签到结果（最多 {max_wait}s）…")
+    for i in range(max_wait // 2):
+        sb.sleep(2)
+
+        # 检测 Turnstile 弹窗
+        try:
+            ts_state = sb.execute_script("""
+                var tk = document.querySelector('[name="cf-turnstile-response"]');
+                var ifr = document.querySelectorAll('iframe[src*="challenges.cloudflare"]');
+                return JSON.stringify({
+                    token_len: tk ? (tk.value || '').length : -1,
+                    iframe_count: ifr.length
+                });
+            """)
+            d = json.loads(ts_state) if ts_state else {}
+            if d.get("iframe_count", 0) > 0 and d.get("token_len", 0) < 20:
+                print(f"  🔐 检测到 Turnstile 弹窗（iframe={d['iframe_count']}），尝试点击…")
+                try:
+                    sb.uc_gui_click_captcha()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 检测按钮状态
+        info = find_checkin_state(sb)
+        st = info.get("state", "not_found")
+        txt = info.get("text", "")
+        if st == "already":
+            print(f"  ✅ 第 {i*2}s 签到成功，按钮变为: '{txt}'")
+            return info
+
+        if i % 5 == 4:
+            print(f"  ⏳ {i*2}s: state={st} text='{txt}'")
+
+    print(f"  ⚠️ {max_wait}s 内状态未变化")
+    return find_checkin_state(sb)
 
 
 def browser_checkin():
@@ -356,7 +422,6 @@ def browser_checkin():
                     result["error"] = f"点击 Turnstile 后被劫持: {cur[:80]}"
                     return result
 
-                # 检查 token
                 try:
                     tk = sb.execute_script("""
                         var el = document.querySelector('[name="cf-turnstile-response"]');
@@ -499,14 +564,8 @@ def browser_checkin():
             clicked = click_checkin_button(sb, btn_el)
             result["checkin_clicked"] = True
 
-            # ★ 等更久（签到请求可能需要时间）
-            print("⏳ 等待签到请求完成（20s）…")
-            sb.sleep(20)
-
-            # 检测状态变化
-            print("🔍 检查签到后状态…")
-            new_state = find_checkin_state(sb)
-            print(f"  新状态: state={new_state.get('state','?')} text='{new_state.get('text','')}'")
+            # 等结果
+            new_state = wait_checkin_result(sb, max_wait=40)
             result["button_after"] = new_state.get("text", "")
 
             # 读金额
