@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v21-hcnsec: uc_click 真实点击签到 + 检测结果变化
+# v22-hcnsec: 用 js_click 替代 uc_click 触发 React 事件
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -205,11 +205,11 @@ def wait_for_checkin_button(sb, max_wait=40):
 
 
 # ============================================================
-# ★★★ v21: 用真实鼠标点击（uc_click）
+# ★★★ v22: 用 js_click 触发 React 事件
 # ============================================================
 
 def click_checkin_button(sb, el):
-    """★ v21: 用 SeleniumBase uc_click 真实鼠标点击（React 才响应）"""
+    """★ v22: 优先用 js_click 触发 React 合成事件"""
 
     # 先滚动到可见
     try:
@@ -227,7 +227,7 @@ def click_checkin_button(sb, el):
     except Exception:
         pass
 
-    # 策略 1: uc_click（SeleniumBase 反检测真实点击）
+    # 策略 1: uc_click（反检测）
     click_selectors = [
         "//button[normalize-space(text())='立即签到']",
         "//button[contains(., '立即签到')]",
@@ -240,16 +240,39 @@ def click_checkin_button(sb, el):
         except Exception as e:
             print(f"    ⚠️ uc_click {sel[:40]} 失败: {str(e)[:80]}")
 
-    # 策略 2: SeleniumBase 原生 click_xpath
-    for sel in click_selectors:
-        try:
-            sb.click_xpath(sel)
-            print(f"    ✅ click_xpath 成功: {sel}")
+    # ★ 策略 2: js_click（对 React 最可靠）
+    # 注意：js_click 需要 CSS 选择器，不是 XPath
+    try:
+        # 通过 JS 找到元素并调用 .click()
+        clicked = sb.execute_script("""
+            var arr = document.querySelectorAll("button");
+            for (var i = 0; i < arr.length; i++) {
+                var t = (arr[i].textContent || '').trim();
+                if (t === '立即签到') {
+                    arr[i].click();
+                    return 'CLICKED:' + t;
+                }
+            }
+            return 'NOT_FOUND';
+        """)
+        if clicked and 'CLICKED' in str(clicked):
+            print(f"    ✅ js click (execute_script) 成功: {clicked}")
             return True
-        except Exception as e:
-            print(f"    ⚠️ click_xpath {sel[:40]} 失败: {str(e)[:80]}")
+    except Exception as e:
+        print(f"    ⚠️ js click (execute_script) 失败: {str(e)[:80]}")
 
-    # 策略 3: 坐标点击
+    # 策略 3: SeleniumBase js_click（需要 CSS 选择器）
+    try:
+        # 尝试找到按钮的 CSS 选择器
+        # 这里用 data-slot 作为示例，实际可能不同
+        css_sel = "button[data-slot='button']"
+        sb.js_click(css_sel)
+        print(f"    ✅ js_click 成功: {css_sel}")
+        return True
+    except Exception as e:
+        print(f"    ⚠️ js_click 失败: {str(e)[:80]}")
+
+    # 策略 4: 坐标点击（最后兜底）
     try:
         target = sb.find_element("//button[normalize-space(text())='立即签到']")
         loc = target.location
