@@ -11,15 +11,13 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install seleniumbase requests
@@ -103,31 +101,63 @@ jobs:
               outbound['tls']['reality'] = {"enabled": True,
                                             "public_key": params.get('pbk', [''])[0],
                                             "short_id": params.get('sid', [''])[0]}
-          config = {"log": {"level": "warn"},
-                    "inbounds": [
-                        {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
-                        {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}],
-                    "outbounds": [outbound],
-                    "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}}
+
+          # ★★★ 关键：block Cloudflare Turnstile 域名
+          config = {
+              "log": {"level": "warn"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in",
+                   "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http", "tag": "http-in",
+                   "listen": "127.0.0.1", "listen_port": 1081}
+              ],
+              "outbounds": [
+                  outbound,
+                  {"type": "block", "tag": "block"}
+              ],
+              "route": {
+                  "rules": [
+                      # ★ 屏蔽 Cloudflare Turnstile + 常见广告域
+                      {"domain": [
+                          "challenges.cloudflare.com",
+                          "s0-greate.net",
+                          "www.s0-greate.net",
+                          "googletagmanager.com",
+                          "www.googletagmanager.com",
+                          "google-analytics.com",
+                          "www.google-analytics.com",
+                          "googlesyndication.com",
+                          "doubleclick.net",
+                          "googleadservices.com"
+                      ], "outbound": "block"},
+                      {"outbound": "vless-out", "protocol": ["tcp", "udp"]}
+                  ]
+              }
+          }
           with open("sing-box-config.json", "w") as f:
               json.dump(config, f, indent=2)
+          print("======== sing-box config ========")
+          print(json.dumps(config, indent=2, ensure_ascii=False))
           PYEOF
 
           nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
           sleep 5
           if ss -tuln 2>/dev/null | grep -q ':1080'; then
             echo "proxy_ready=true" >> "$GITHUB_OUTPUT"
-            echo "✅ sing-box 代理已启动 (socks5://127.0.0.1:1080)"
+            echo "✅ sing-box 代理已启动"
           else
             cat sing-box.log
             echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Verify proxy
+      - name: Verify
         if: steps.singbox.outputs.proxy_ready == 'true'
         run: |
           echo "======== 代理出口 IP ========"
           curl -s --max-time 15 -x socks5h://127.0.0.1:1080 https://api.ipify.org || echo "  (失败)"
+          echo ""
+          echo "======== 验证 turnstile 被屏蔽 ========"
+          curl -sI --max-time 10 -x socks5h://127.0.0.1:1080 https://challenges.cloudflare.com/turnstile/v0/api.js 2>&1 | head -3 || echo "  ✅ 已阻断"
 
       - name: Run checkin
         if: steps.singbox.outputs.proxy_ready == 'true'
