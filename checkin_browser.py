@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+# v18-hcnsec: 等签到按钮出现 + 保存 profile 源码
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -58,7 +58,6 @@ def check_url(sb, expected_contains="hcnsec", tag=""):
 
 
 def safe_goto(sb, url, tag=""):
-    """安全跳转，避免 sb.open() 的 CDP 重连问题"""
     print(f"  跳转 {url} ({tag})")
     try:
         sb.uc_open_with_reconnect(url, reconnect_time=4)
@@ -230,6 +229,38 @@ def find_checkin_button(sb):
     except Exception: return {"state": "not_found"}
 
 
+def wait_for_checkin_button(sb, max_wait=40):
+    """★ 等待签到按钮出现（处理 SPA 惰性渲染）"""
+    print(f"🔍 等待签到按钮出现（最多 {max_wait}s）…")
+    info = {"state": "not_found"}
+    for i in range(max_wait // 2):
+        sb.sleep(2)
+        # 检查页面是否被劫持
+        cur = sb.get_current_url()
+        if "hcnsec" not in cur:
+            print(f"  ❌ 页面被劫持到: {cur}")
+            return {"state": "not_found", "hijacked": cur}
+
+        info = find_checkin_button(sb)
+        st = info.get("state", "not_found")
+        if st != "not_found":
+            print(f"  ✅ 第 {i*2}s 找到按钮: state={st} text='{info.get('text','')}'")
+            return info
+        # 每 10s 打印一次诊断
+        if i % 5 == 4:
+            try:
+                body_len = sb.execute_script("return (document.body.innerText || '').length;")
+                btn_count = sb.execute_script("return document.querySelectorAll('button').length;")
+                iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
+                has_text = sb.execute_script("return document.body.innerText.indexOf('签到') >= 0;")
+                print(f"    {i*2}s: 文本长度={body_len}, 按钮数={btn_count}, iframe={iframe_count}, 含'签到'={has_text}")
+            except Exception as e:
+                print(f"    诊断异常: {e}")
+
+    print(f"  ⚠️ {max_wait}s 内未找到按钮")
+    return info
+
+
 def browser_checkin():
     from seleniumbase import SB
 
@@ -338,7 +369,7 @@ def browser_checkin():
             st = get_turnstile_state(sb)
             print(f"\n🔍 Turnstile 状态: {json.dumps(st, ensure_ascii=False)}")
 
-            # ★★★ 点 Turnstile
+            # 点 Turnstile
             print("\n🎯 尝试 uc_gui_click_captcha 点击 Turnstile…")
             for attempt in range(5):
                 try:
@@ -434,21 +465,16 @@ def browser_checkin():
             if not logged_in:
                 print("❌ 登录未成功")
                 sb.save_screenshot("login_failed.png")
-                try:
-                    with open("login_failed.html", "w", encoding="utf-8") as f:
-                        f.write(sb.get_page_source())
-                except Exception:
-                    pass
                 result["error"] = "登录失败"
                 return result
 
             result["logged_in"] = True
             sb.sleep(3)
 
-            # ★★★ 打开 profile —— 用 safe_goto 避免 sb.open() 的 CDP 重连问题
+            # 打开 profile
             print("📄 打开个人资料页面…")
             safe_goto(sb, PROFILE_URL, tag="profile")
-            sb.sleep(6)
+            sb.sleep(3)
 
             ok, cur = check_url(sb, "hcnsec", tag="profile")
             if not ok:
@@ -460,12 +486,28 @@ def browser_checkin():
 
             print(f"  当前页面: {cur}")
 
-            print("🔍 检测签到按钮状态…")
-            info = find_checkin_button(sb)
-            print(f"  按钮状态: {json.dumps(info, ensure_ascii=False)}")
+            # ★★★ 保存 profile 页源码（诊断用）
+            try:
+                with open("profile_page.html", "w", encoding="utf-8") as f:
+                    f.write(sb.get_page_source())
+                print("  📄 已保存 profile_page.html")
+            except Exception as e:
+                print(f"  保存源码失败: {e}")
+
+            # ★★★ 等签到按钮出现
+            info = wait_for_checkin_button(sb, max_wait=40)
+
+            # 如果是被劫持
+            if info.get("hijacked"):
+                result["error"] = f"等待按钮时被劫持: {info['hijacked'][:80]}"
+                return result
+
             state = info.get("state", "not_found")
             result["button_before"] = info.get("text", "")
 
+            print(f"  最终按钮状态: {json.dumps(info, ensure_ascii=False)}")
+
+            # 已签到
             if state == "already":
                 print(f"✅ 今日已签到")
                 result["already_done"] = True
@@ -478,17 +520,53 @@ def browser_checkin():
                 except Exception: pass
                 return result
 
+            # 未找到
             if state == "not_found":
-                result["error"] = "未找到签到按钮"
-                sb.save_screenshot("no_checkin_button.png")
+                print("❌ 未找到签到按钮")
+                # 列出所有按钮
+                print("  所有按钮:")
+                for j, b in enumerate(list_all_buttons(sb)):
+                    print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']} visible={b['visible']}")
+                # 检查是否有 iframe
                 try:
-                    with open("no_checkin_button.html", "w", encoding="utf-8") as f:
-                        f.write(sb.get_page_source())
+                    iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
+                    print(f"  iframe 数量: {iframe_count}")
+                    # 列 iframe src
+                    srcs = sb.execute_script("""
+                        var out = [];
+                        document.querySelectorAll('iframe').forEach(function(f) {
+                            out.push((f.src || '').slice(0, 200));
+                        });
+                        return out;
+                    """)
+                    for s in (srcs or []):
+                        print(f"    iframe: {s}")
                 except Exception:
                     pass
+                # 检查页面文本
+                try:
+                    body_text = sb.execute_script("return (document.body.innerText || '').slice(0, 2000);")
+                    print(f"  页面文本前 2000 字: {body_text[:500]}")
+                except Exception:
+                    pass
+                sb.save_screenshot("no_checkin_button.png")
+                result["error"] = "未找到签到按钮"
                 return result
 
+            # ready - 执行签到
             print(f"  ✅ 找到'立即签到'按钮")
+
+            # 滚动到按钮可见
+            try:
+                sb.execute_script("""
+                    var el = document.querySelector("[data-checkin-target='1']");
+                    if (el && el.scrollIntoView) el.scrollIntoView({block: 'center'});
+                """)
+                sb.sleep(1)
+            except Exception:
+                pass
+
+            # JS 原生 click
             sb.execute_script("""
                 var el = document.querySelector("[data-checkin-target='1']");
                 if (!el) return false;
