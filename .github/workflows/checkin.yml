@@ -151,7 +151,7 @@ jobs:
           CHROME_PROXY: socks5://127.0.0.1:1080
           HTTPS_PROXY:  http://127.0.0.1:1081
         run: |
-          python hcnsec_checkin.py
+          python checkin_browser.py
 
       - name: Upload screenshots
         if: always()
