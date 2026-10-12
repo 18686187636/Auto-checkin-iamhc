@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v22-hcnsec: 用 js_click 替代 uc_click 触发 React 事件
+# v23-hcnsec: 每次点击后立即诊断 + 多层点击策略 + Enter 兜底
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -89,10 +89,6 @@ def get_turnstile_state(sb):
         return f"err:{e}"
 
 
-# ============================================================
-# 全部用 Selenium XPath API
-# ============================================================
-
 def find_checkin_state(sb):
     """用 Selenium XPath 检测签到按钮状态"""
     try:
@@ -132,7 +128,6 @@ def find_checkin_state(sb):
 
 
 def read_amount_via_xpath(sb):
-    """用 XPath 读'今天 +¥X.XX'金额"""
     try:
         xpaths = [
             "//p[contains(text(), '今天') and contains(text(), '¥')]",
@@ -192,25 +187,58 @@ def wait_for_checkin_button(sb, max_wait=40):
         if st != "not_found":
             print(f"  ✅ 第 {i*2}s 找到按钮: state={st} text='{info.get('text','')}'")
             return info
-        if i % 5 == 4:
-            try:
-                has_text = sb.is_text_visible("立即签到", "button") or \
-                           sb.is_text_visible("立即签到")
-                print(f"    {i*2}s: 含'立即签到'={has_text}")
-            except Exception as e:
-                print(f"    {i*2}s: 检测异常 {str(e)[:60]}")
-
     print(f"  ⚠️ {max_wait}s 内未找到按钮")
     return info
 
 
 # ============================================================
-# ★★★ v22: 用 js_click 触发 React 事件
+# ★★★ v23: 点击后立即诊断
 # ============================================================
 
-def click_checkin_button(sb, el):
-    """★ v22: 优先用 js_click 触发 React 合成事件"""
+def diagnose_after_click(sb, label=""):
+    """点击后立即诊断：请求 / DOM / 网络"""
+    print(f"    🔬 点击后诊断 [{label}]:")
+    try:
+        # 1. 最近的网络请求
+        net = sb.execute_script("""
+            var entries = performance.getEntriesByType('resource');
+            var recent = entries.slice(-8).map(function(e) {
+                return e.initiatorType + ' ' + e.name.slice(-80) + ' (' + Math.round(e.duration) + 'ms)';
+            });
+            return recent.join('\\n');
+        """)
+        if net:
+            for line in net.split('\n')[-5:]:
+                print(f"      {line}")
+    except Exception as e:
+        print(f"      网络诊断异常: {str(e)[:60]}")
 
+    try:
+        # 2. 按钮的 disabled 属性（React 里点击后可能短暂 disable）
+        info = sb.execute_script("""
+            var btn = null;
+            var arr = document.querySelectorAll('button');
+            for (var i = 0; i < arr.length; i++) {
+                if ((arr[i].textContent || '').trim() === '立即签到') {
+                    btn = arr[i]; break;
+                }
+            }
+            if (!btn) return 'BTN_NOT_FOUND';
+            return JSON.stringify({
+                disabled: btn.disabled,
+                hasClickHandler: !!btn.onclick,
+                className: (btn.className || '').slice(0, 100),
+                parentTag: btn.parentElement ? btn.parentElement.tagName : '',
+                parentClass: btn.parentElement ? (btn.parentElement.className || '').slice(0, 80) : ''
+            });
+        """)
+        print(f"      按钮属性: {info}")
+    except Exception as e:
+        print(f"      按钮诊断异常: {str(e)[:60]}")
+
+
+def click_checkin_button_v2(sb, el):
+    """★ v23: 每次点击后立即诊断，多种策略轮询"""
     # 先滚动到可见
     try:
         sb.execute_script("""
@@ -227,70 +255,131 @@ def click_checkin_button(sb, el):
     except Exception:
         pass
 
-    # 策略 1: uc_click（反检测）
-    click_selectors = [
-        "//button[normalize-space(text())='立即签到']",
-        "//button[contains(., '立即签到')]",
-    ]
-    for sel in click_selectors:
-        try:
-            sb.uc_click(sel, timeout=5)
-            print(f"    ✅ uc_click 成功: {sel}")
-            return True
-        except Exception as e:
-            print(f"    ⚠️ uc_click {sel[:40]} 失败: {str(e)[:80]}")
+    xpath = "//button[normalize-space(text())='立即签到']"
 
-    # ★ 策略 2: js_click（对 React 最可靠）
-    # 注意：js_click 需要 CSS 选择器，不是 XPath
+    # ===== 策略 1: JS 原生 click（React 事件委托最强路径） =====
+    print("    ▶️ 策略 1: JS 原生 click")
     try:
-        # 通过 JS 找到元素并调用 .click()
-        clicked = sb.execute_script("""
-            var arr = document.querySelectorAll("button");
+        r1 = sb.execute_script("""
+            var arr = document.querySelectorAll('button');
             for (var i = 0; i < arr.length; i++) {
-                var t = (arr[i].textContent || '').trim();
-                if (t === '立即签到') {
+                if ((arr[i].textContent || '').trim() === '立即签到') {
                     arr[i].click();
-                    return 'CLICKED:' + t;
+                    return 'CLICKED';
                 }
             }
             return 'NOT_FOUND';
         """)
-        if clicked and 'CLICKED' in str(clicked):
-            print(f"    ✅ js click (execute_script) 成功: {clicked}")
-            return True
+        print(f"      结果: {r1}")
+        sb.sleep(2)
+        state = find_checkin_state(sb).get("state", "?")
+        print(f"      点击后按钮: {state}")
+        if state == "already":
+            return "JS_CLICK_OK"
+        diagnose_after_click(sb, "strategy-1-js-click")
     except Exception as e:
-        print(f"    ⚠️ js click (execute_script) 失败: {str(e)[:80]}")
+        print(f"      异常: {str(e)[:80]}")
 
-    # 策略 3: SeleniumBase js_click（需要 CSS 选择器）
+    # ===== 策略 2: element.click() via Selenium =====
+    print("    ▶️ 策略 2: Selenium element.click()")
     try:
-        # 尝试找到按钮的 CSS 选择器
-        # 这里用 data-slot 作为示例，实际可能不同
-        css_sel = "button[data-slot='button']"
-        sb.js_click(css_sel)
-        print(f"    ✅ js_click 成功: {css_sel}")
-        return True
+        target = sb.find_element(xpath)
+        target.click()
+        print("      element.click() 已调用")
+        sb.sleep(2)
+        state = find_checkin_state(sb).get("state", "?")
+        print(f"      点击后按钮: {state}")
+        if state == "already":
+            return "SELENIUM_CLICK_OK"
+        diagnose_after_click(sb, "strategy-2-selenium-click")
     except Exception as e:
-        print(f"    ⚠️ js_click 失败: {str(e)[:80]}")
+        print(f"      异常: {str(e)[:80]}")
 
-    # 策略 4: 坐标点击（最后兜底）
+    # ===== 策略 3: 逐层向上派发 click（事件可能挂在父级） =====
+    print("    ▶️ 策略 3: 逐层向上派发 click")
     try:
-        target = sb.find_element("//button[normalize-space(text())='立即签到']")
-        loc = target.location
-        size = target.size
-        x = loc["x"] + size["width"] / 2
-        y = loc["y"] + size["height"] / 2
-        print(f"    坐标点击: ({x:.0f}, {y:.0f})")
-        sb.uc_gui_click_x_y(x, y)
-        print(f"    ✅ 坐标点击成功")
-        return True
+        r3 = sb.execute_script("""
+            var arr = document.querySelectorAll('button');
+            var target = null;
+            for (var i = 0; i < arr.length; i++) {
+                if ((arr[i].textContent || '').trim() === '立即签到') {
+                    target = arr[i]; break;
+                }
+            }
+            if (!target) return 'NOT_FOUND';
+            var chain = [];
+            var el = target;
+            for (var j = 0; j < 5 && el; j++) {
+                try { el.click(); chain.push(el.tagName + (el.className ? '.' + el.className.split(' ')[0] : '')); } catch(e) {}
+                el = el.parentElement;
+            }
+            return 'CLICKED_CHAIN:' + chain.join(' -> ');
+        """)
+        print(f"      结果: {r3}")
+        sb.sleep(2)
+        state = find_checkin_state(sb).get("state", "?")
+        print(f"      点击后按钮: {state}")
+        if state == "already":
+            return "CHAIN_CLICK_OK"
+        diagnose_after_click(sb, "strategy-3-chain")
     except Exception as e:
-        print(f"    ⚠️ 坐标点击失败: {str(e)[:80]}")
+        print(f"      异常: {str(e)[:80]}")
 
-    return False
+    # ===== 策略 4: 用真实的鼠标事件派发（MouseEvent） =====
+    print("    ▶️ 策略 4: 派发 MouseEvent")
+    try:
+        r4 = sb.execute_script("""
+            var arr = document.querySelectorAll('button');
+            var target = null;
+            for (var i = 0; i < arr.length; i++) {
+                if ((arr[i].textContent || '').trim() === '立即签到') {
+                    target = arr[i]; break;
+                }
+            }
+            if (!target) return 'NOT_FOUND';
+            var rect = target.getBoundingClientRect();
+            var x = rect.left + rect.width / 2;
+            var y = rect.top + rect.height / 2;
+            ['mousedown', 'mouseup', 'click'].forEach(function(type) {
+                var ev = new MouseEvent(type, {
+                    view: window, bubbles: true, cancelable: true,
+                    clientX: x, clientY: y, button: 0
+                });
+                target.dispatchEvent(ev);
+            });
+            return 'DISPATCHED';
+        """)
+        print(f"      结果: {r4}")
+        sb.sleep(2)
+        state = find_checkin_state(sb).get("state", "?")
+        print(f"      点击后按钮: {state}")
+        if state == "already":
+            return "MOUSE_EVENT_OK"
+        diagnose_after_click(sb, "strategy-4-mouse-event")
+    except Exception as e:
+        print(f"      异常: {str(e)[:80]}")
+
+    # ===== 策略 5: 键盘 Enter =====
+    print("    ▶️ 策略 5: 焦点 + Enter 键")
+    try:
+        target = sb.find_element(xpath)
+        target.click()  # 先聚焦
+        sb.sleep(0.3)
+        sb.press_keys(xpath, "\n")
+        print("      Enter 已按下")
+        sb.sleep(2)
+        state = find_checkin_state(sb).get("state", "?")
+        print(f"      点击后按钮: {state}")
+        if state == "already":
+            return "ENTER_OK"
+    except Exception as e:
+        print(f"      异常: {str(e)[:80]}")
+
+    return "ALL_FAILED"
 
 
 def wait_checkin_result(sb, max_wait=40):
-    """★ v21: 等按钮状态变化，或检测 Turnstile 弹窗"""
+    """等按钮状态变化，或检测 Turnstile 弹窗"""
     print(f"⏳ 等待签到结果（最多 {max_wait}s）…")
     for i in range(max_wait // 2):
         sb.sleep(2)
@@ -307,7 +396,7 @@ def wait_checkin_result(sb, max_wait=40):
             """)
             d = json.loads(ts_state) if ts_state else {}
             if d.get("iframe_count", 0) > 0 and d.get("token_len", 0) < 20:
-                print(f"  🔐 检测到 Turnstile 弹窗（iframe={d['iframe_count']}），尝试点击…")
+                print(f"  🔐 检测到 Turnstile 弹窗，尝试点击…")
                 try:
                     sb.uc_gui_click_captcha()
                 except Exception:
@@ -315,7 +404,6 @@ def wait_checkin_result(sb, max_wait=40):
         except Exception:
             pass
 
-        # 检测按钮状态
         info = find_checkin_state(sb)
         st = info.get("state", "not_found")
         txt = info.get("text", "")
@@ -324,7 +412,7 @@ def wait_checkin_result(sb, max_wait=40):
             return info
 
         if i % 5 == 4:
-            print(f"  ⏳ {i*2}s: state={st} text='{txt}'")
+            print(f"  ⏳ {i*2}s: state={st}")
 
     print(f"  ⚠️ {max_wait}s 内状态未变化")
     return find_checkin_state(sb)
@@ -383,8 +471,6 @@ def browser_checkin():
                     print(f"  ✅ {st}")
                     break
                 sb.sleep(1)
-            else:
-                print(f"  ⚠️ {st}")
 
             # 填表
             print("\n✍️ 填写表单…")
@@ -417,17 +503,6 @@ def browser_checkin():
                     sb.sleep(1.5)
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
-
-            # 检查登录按钮
-            print("\n🔍 检查登录按钮…")
-            try:
-                login_btn = sb.find_element("button[type='submit']")
-                if login_btn.is_enabled():
-                    print("  ✅ 登录按钮可用")
-                else:
-                    print("  ⚠️ 登录按钮 disabled")
-            except Exception as e:
-                print(f"  ⚠️ {e}")
 
             # 点 Turnstile
             print("\n🎯 尝试 uc_gui_click_captcha 点击 Turnstile…")
@@ -473,7 +548,6 @@ def browser_checkin():
                     except Exception:
                         pass
                     if i % 10 == 9:
-                        print(f"  ⏳ {i+1}s")
                         try:
                             sb.uc_gui_click_captcha()
                         except Exception:
@@ -549,17 +623,14 @@ def browser_checkin():
 
             # 等签到按钮
             info = wait_for_checkin_button(sb, max_wait=40)
-
             if info.get("hijacked"):
                 result["error"] = f"等待按钮时被劫持: {info['hijacked'][:80]}"
                 return result
 
             state = info.get("state", "not_found")
             result["button_before"] = info.get("text", "")
-
             print(f"  最终按钮状态: state={state} text='{info.get('text','')}'")
 
-            # 已签到
             if state == "already":
                 print(f"✅ 今日已签到")
                 result["already_done"] = True
@@ -581,17 +652,17 @@ def browser_checkin():
                 result["error"] = "未找到签到按钮"
                 return result
 
-            # ready - 点击签到
-            print(f"  ✅ 找到'立即签到'按钮，点击…")
+            # ready - 用 v23 的多策略点击
+            print(f"  ✅ 找到'立即签到'按钮，开始多层点击…")
             btn_el = info.get("el")
-            clicked = click_checkin_button(sb, btn_el)
+            click_result = click_checkin_button_v2(sb, btn_el)
             result["checkin_clicked"] = True
+            print(f"  ▶️ 点击结果: {click_result}")
 
             # 等结果
             new_state = wait_checkin_result(sb, max_wait=40)
             result["button_after"] = new_state.get("text", "")
 
-            # 读金额
             award_text, award_amount = read_amount_via_xpath(sb)
             result["award_text"] = award_text
             result["award_amount"] = award_amount
@@ -599,7 +670,6 @@ def browser_checkin():
 
             try: sb.save_screenshot("checkin_result.png")
             except Exception: pass
-
             return result
 
         except Exception as e:
