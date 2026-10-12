@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v16-hcnsec: 屏蔽广告但放行 Turnstile + uc_gui_click_captcha
+
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -57,8 +57,28 @@ def check_url(sb, expected_contains="hcnsec", tag=""):
     return True, cur
 
 
+def safe_goto(sb, url, tag=""):
+    """安全跳转，避免 sb.open() 的 CDP 重连问题"""
+    print(f"  跳转 {url} ({tag})")
+    try:
+        sb.uc_open_with_reconnect(url, reconnect_time=4)
+        return True
+    except Exception as e:
+        print(f"  ⚠️ uc_open_with_reconnect 失败: {e}")
+    try:
+        sb.driver.get(url)
+        return True
+    except Exception as e:
+        print(f"  ⚠️ driver.get 失败: {e}")
+    try:
+        sb.execute_script(f"window.location.href = '{url}';")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ js location 失败: {e}")
+    return False
+
+
 def get_turnstile_state(sb):
-    """返回 dict: {turnstile_api, cf_widget, data_sitekey, token_len, iframe_count, iframe_src}"""
     try:
         raw = sb.execute_script("""
             var ifr = document.querySelectorAll('iframe');
@@ -311,28 +331,24 @@ def browser_checkin():
             if login_sel:
                 print(f"  ✅ 按钮可用: '{login_text}'")
             else:
-                print("  ⚠️ 按钮 disabled（Turnstile token 未就绪？）")
+                print("  ⚠️ 按钮 disabled（Turnstile token 未就绪）")
                 for j, b in enumerate(list_all_buttons(sb)):
                     print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']}")
 
-            # 检查 iframe（Turnstile widget 是否渲染）
             st = get_turnstile_state(sb)
             print(f"\n🔍 Turnstile 状态: {json.dumps(st, ensure_ascii=False)}")
 
-            # ★★★ 核心：uc_gui_click_captcha 点 Turnstile
-            #    v11 之前之所以触发雅虎跳转，是因为 s0-greate 的覆盖层
-            #    现在 s0-greate 被 sing-box 屏蔽，覆盖层不存在，安全了
+            # ★★★ 点 Turnstile
             print("\n🎯 尝试 uc_gui_click_captcha 点击 Turnstile…")
             for attempt in range(5):
                 try:
                     sb.uc_gui_click_captcha()
-                    print(f"  第 {attempt+1} 次点击 (uc_gui_click_captcha)")
+                    print(f"  第 {attempt+1} 次点击")
                 except Exception as e:
                     print(f"  第 {attempt+1} 次异常: {e}")
                 sb.sleep(3)
 
-                # 每次点击后检查 URL 和状态
-                ok, cur = check_url(sb, "hcnsec", tag=f"after_captcha_click_{attempt+1}")
+                ok, cur = check_url(sb, "hcnsec", tag=f"after_captcha_{attempt+1}")
                 if not ok:
                     result["error"] = f"点击 Turnstile 后被劫持: {cur[:80]}"
                     return result
@@ -342,8 +358,6 @@ def browser_checkin():
                 if token_len and token_len > 20:
                     print(f"  ✅ Token 出现！长度={token_len}")
                     break
-                if st.get("iframe_count", 0) > 0:
-                    print(f"  有 {st['iframe_count']} 个 iframe，srcs={st.get('iframe_srcs')}")
 
             # 等 token
             print("\n⏳ 等待 Turnstile token（最多 60s）…")
@@ -356,7 +370,7 @@ def browser_checkin():
                     token_ok = True
                     break
                 if i % 10 == 9:
-                    print(f"  ⏳ {i+1}s: token_len={st.get('token_len')}, iframe={st.get('iframe_count')}")
+                    print(f"  ⏳ {i+1}s: token_len={st.get('token_len')}")
                     try:
                         sb.uc_gui_click_captcha()
                     except Exception:
@@ -378,8 +392,6 @@ def browser_checkin():
                 print(f"  ✅ 按钮可用: '{login_text}'")
             else:
                 print("  ⚠️ 按钮仍 disabled，强点")
-                for j, b in enumerate(list_all_buttons(sb)):
-                    print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']}")
 
             # 点登录
             print("\n🖱️ 点击登录按钮…")
@@ -433,10 +445,11 @@ def browser_checkin():
             result["logged_in"] = True
             sb.sleep(3)
 
-            # 打开 profile
+            # ★★★ 打开 profile —— 用 safe_goto 避免 sb.open() 的 CDP 重连问题
             print("📄 打开个人资料页面…")
-            sb.open(PROFILE_URL)
+            safe_goto(sb, PROFILE_URL, tag="profile")
             sb.sleep(6)
+
             ok, cur = check_url(sb, "hcnsec", tag="profile")
             if not ok:
                 result["error"] = f"打开 profile 跳到异常域名: {cur[:80]}"
@@ -444,6 +457,8 @@ def browser_checkin():
             if "sign-in" in cur or "/login" in cur:
                 result["error"] = "登录状态失效"
                 return result
+
+            print(f"  当前页面: {cur}")
 
             print("🔍 检测签到按钮状态…")
             info = find_checkin_button(sb)
@@ -466,6 +481,11 @@ def browser_checkin():
             if state == "not_found":
                 result["error"] = "未找到签到按钮"
                 sb.save_screenshot("no_checkin_button.png")
+                try:
+                    with open("no_checkin_button.html", "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                except Exception:
+                    pass
                 return result
 
             print(f"  ✅ 找到'立即签到'按钮")
@@ -480,6 +500,7 @@ def browser_checkin():
                 t.click();
             """)
             result["checkin_clicked"] = True
+            print("✅ 已点击签到")
             sb.sleep(15)
 
             award_text, award_amount = read_award_amount(sb)
