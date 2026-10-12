@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v8-hcnsec: CDP 屏蔽 + JS 原生 click 同意 + 全链路诊断
+# v9-hcnsec: 屏蔽 s0-greate.net + 删除 uc_gui_click_captcha + 先点登录再处理 Turnstile
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -21,17 +21,8 @@ LOGIN_URL  = f"{BASE_URL}/sign-in"
 LOGIN_PATH = "/sign-in"
 PROFILE_URL = f"{BASE_URL}/profile"
 
-BLOCKED_PATTERNS = [
-    "*s0-greate.net*",
-    "*googletagmanager.com*",
-    "*google-analytics.com*",
-    "*googlesyndication.com*",
-    "*doubleclick.net*",
-    "*googleadservices.com*",
-    "*adservice.google*",
-    "*pagead2*",
-    "*gstatic.com/recaptcha*",
-]
+# ★ 只屏蔽一个域名，避免 SeleniumBase 逗号拆分问题
+BLOCKED_HOST = "s0-greate.net"
 
 
 def _requests_proxies():
@@ -266,6 +257,9 @@ def browser_checkin():
 
     print("🚀 启动浏览器（UC 模式）…")
 
+    # ★ v9: 单域名 host-resolver-rules（不含逗号，SeleniumBase 不会拆）
+    resolver_rule = f"MAP {BLOCKED_HOST} 0.0.0.0"
+
     sb_kwargs = dict(
         uc=True,
         headed=True,
@@ -273,7 +267,11 @@ def browser_checkin():
         incognito=True,
         locale_code="zh-CN",
         window_size="1920,1080",
-        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled",
+        chromium_arg=(
+            "--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
+            "--disable-blink-features=AutomationControlled,"
+            f"--host-resolver-rules={resolver_rule}"
+        ),
     )
     if CHROME_PROXY:
         print(f"🌐 浏览器代理: {CHROME_PROXY}")
@@ -286,32 +284,14 @@ def browser_checkin():
     else:
         print("🌐 requests 代理: 未启用（直连）")
 
+    print(f"🚫 DNS 屏蔽: {BLOCKED_HOST} → 0.0.0.0")
+
     with SB(**sb_kwargs) as sb:
         try:
-            # ---------- CDP 屏蔽（页面加载前 + 后各一次） ----------
-            print("🛡️ 启用 CDP 网络屏蔽…")
-            try:
-                sb.driver.execute_cdp_cmd("Network.enable", {})
-                sb.driver.execute_cdp_cmd("Network.setBlockedURLs", {
-                    "urls": BLOCKED_PATTERNS
-                })
-                print(f"   ✅ 已屏蔽 {len(BLOCKED_PATTERNS)} 条规则")
-            except Exception as e:
-                print(f"   ⚠️ CDP 屏蔽失败: {e}")
-
             # ---------- 打开登录页 ----------
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
-
-            # ★ 页面加载后再应用一次（防 UC 重连后 CDP 失效）
-            try:
-                sb.driver.execute_cdp_cmd("Network.enable", {})
-                sb.driver.execute_cdp_cmd("Network.setBlockedURLs", {
-                    "urls": BLOCKED_PATTERNS
-                })
-            except Exception:
-                pass
 
             # ---------- 等 React 渲染 ----------
             print("⏳ 等待 React 渲染完成…")
@@ -332,17 +312,13 @@ def browser_checkin():
 
             if not react_ready:
                 print("❌ React 20s 内未渲染完成")
-                try:
-                    sb.save_screenshot("react_timeout.png")
-                except Exception:
-                    pass
                 result["error"] = "React 未渲染"
                 return result
 
             print(f"  当前 URL: {sb.get_current_url()}")
             print(f"  页面标题: {sb.get_title()}")
 
-            # ---------- ★ 诊断：所有已加载的脚本 ----------
+            # ---------- 诊断已加载脚本（关键） ----------
             try:
                 loaded_scripts = sb.execute_script("""
                     var out = [];
@@ -359,28 +335,22 @@ def browser_checkin():
                 else:
                     print("    (无外部脚本)")
 
-                # 检查是否有被屏蔽的域名实际加载了
-                blocked_loaded = sb.execute_script("""
+                leaked = sb.execute_script(f"""
                     var out = [];
-                    var patterns = ['s0-greate', 'googletag', 'google-analytics',
-                                    'googlesyndication', 'doubleclick', 'pagead2'];
                     var scripts = document.querySelectorAll('script[src]');
-                    for (var i=0; i<scripts.length; i++) {
-                        var src = scripts[i].src;
-                        for (var j=0; j<patterns.length; j++) {
-                            if (src.indexOf(patterns[j]) >= 0) {
-                                out.push('LEAKED: ' + src.slice(0, 100));
-                            }
-                        }
-                    }
+                    for (var i=0; i<scripts.length; i++) {{
+                        if (scripts[i].src.indexOf('{BLOCKED_HOST}') >= 0) {{
+                            out.push('LEAKED: ' + scripts[i].src.slice(0, 100));
+                        }}
+                    }}
                     return out.join('\\n');
                 """)
-                if blocked_loaded:
+                if leaked:
                     print(f"  ⚠️ 被屏蔽的脚本仍加载了:")
-                    for line in blocked_loaded.split('\n'):
+                    for line in leaked.split('\n'):
                         print(f"    {line}")
                 else:
-                    print("  ✅ 被屏蔽的域名未加载")
+                    print(f"  ✅ {BLOCKED_HOST} 已被成功屏蔽")
             except Exception as e:
                 print(f"  脚本诊断异常: {e}")
 
@@ -405,54 +375,18 @@ def browser_checkin():
                 result["error"] = f"输入密码后被劫持: {cur[:80]}"
                 return result
 
-            # ---------- ★ Consent 元素诊断 ----------
-            print("🔎 诊断 consent 元素…")
-            consent_sel = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
-            try:
-                consent_info = sb.execute_script("""
-                    var els = document.querySelectorAll("span[role='checkbox'][aria-labelledby='legal-consent-label']");
-                    if (els.length === 0) return 'NOT_FOUND';
-                    var out = [];
-                    for (var i=0; i<els.length; i++) {
-                        var r = els[i].getBoundingClientRect();
-                        var cx = r.left + r.width/2;
-                        var cy = r.top + r.height/2;
-                        var top = (cx >= 0 && cy >= 0) ? document.elementFromPoint(cx, cy) : null;
-                        out.push('idx=' + i +
-                            ' rect=[' + Math.round(r.left) + ',' + Math.round(r.top) +
-                            ',' + Math.round(r.width) + ',' + Math.round(r.height) + ']' +
-                            ' ariaChecked=' + els[i].getAttribute('aria-checked') +
-                            ' topElem=' + (top ? top.tagName + '.' + (top.className||'').slice(0,40) : 'NONE') +
-                            ' isSame=' + (top === els[i]));
-                    }
-                    return out.join('\\n');
-                """)
-                print("  " + (consent_info if consent_info else "(null)"))
-            except Exception as e:
-                print(f"  consent 诊断异常: {e}")
-
-            # ---------- ★ 用 JS 原生 click 代替 sb.click ----------
+            # ---------- 勾选同意（JS click） ----------
             print("☑️ 勾选法律同意 (JS 原生 click)…")
+            consent_sel = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
             try:
                 sb.wait_for_element_present(consent_sel, timeout=10)
                 checked = sb.get_attribute(consent_sel, "aria-checked")
-                print(f"  aria-checked 现状: {checked}")
                 if checked != "true":
-                    cur_before = sb.get_current_url()
                     sb.execute_script("""
                         var el = document.querySelector("span[role='checkbox'][aria-labelledby='legal-consent-label']");
-                        if (el && el.getAttribute('aria-checked') !== 'true') {
-                            el.click();
-                        }
+                        if (el && el.getAttribute('aria-checked') !== 'true') el.click();
                     """)
-                    sb.sleep(0.1)
-                    cur_immediate = sb.get_current_url()
-                    print(f"  点击后立即 URL: {cur_immediate}")
-                    if cur_immediate != cur_before:
-                        print(f"  ⚠️ 点击瞬间 URL 就变了: {cur_before} → {cur_immediate}")
-                    sb.sleep(0.8)
-                    cur_after = sb.get_current_url()
-                    print(f"  0.9s 后 URL: {cur_after}")
+                    sb.sleep(0.9)
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
@@ -465,12 +399,10 @@ def browser_checkin():
             try:
                 with open("login_page_source.html", "w", encoding="utf-8") as f:
                     f.write(sb.get_page_source())
-                print("  📄 已保存登录页源码到 login_page_source.html")
-            except Exception as e:
-                print(f"  保存登录页源码失败: {e}")
+            except Exception:
+                pass
 
             # ---------- 出口 IP ----------
-            print("🔍 通过浏览器获取出口 IP…")
             try:
                 ip_info = sb.execute_script("""
                     try {
@@ -478,96 +410,15 @@ def browser_checkin():
                         xhr.open('GET', 'https://api.ipify.org?format=json', false);
                         xhr.send();
                         return xhr.responseText;
-                    } catch(e) {
-                        return 'ERR:' + e.message;
-                    }
+                    } catch(e) { return 'ERR:' + e.message; }
                 """)
                 print(f"  🌐 浏览器出口 IP: {ip_info}")
             except Exception as e:
                 print(f"  IP 检测失败: {e}")
 
-            # ---------- Turnstile 诊断 ----------
-            print("🔬 诊断 Turnstile 结构…")
-            try:
-                diag = sb.execute_script("""
-                    var out = [];
-                    out.push('url=' + location.href);
-                    out.push('iframe_count=' + document.querySelectorAll('iframe').length);
-                    out.push('cf-turnstile=' + document.querySelectorAll('.cf-turnstile').length);
-                    out.push('data-sitekey=' + document.querySelectorAll('[data-sitekey]').length);
-                    var tk = document.querySelector('[name="cf-turnstile-response"]');
-                    out.push('cf-turnstile-response=' + (tk ? ('len:' + (tk.value||'').length) : 'NONE'));
-                    var ifr = document.querySelectorAll('iframe');
-                    for (var j=0; j<ifr.length; j++) {
-                        out.push('iframe['+j+'].src=' + (ifr[j].src||'').slice(0,120));
-                    }
-                    return out.join(' || ');
-                """)
-                print("  " + (diag if diag else "(null)"))
-            except Exception as e:
-                print(f"  诊断异常: {e}")
-
-            try:
-                sb.save_screenshot("turnstile_before.png")
-                print("  📸 turnstile_before.png")
-            except Exception:
-                pass
-
-            # ---------- Turnstile ----------
-            print("⏳ 等待登录 Turnstile…")
-            sb.sleep(5)
-            try:
-                sb.uc_gui_click_captcha()
-            except Exception as e:
-                print(f"  click_captcha 异常: {e}")
-
-            turnstile_ok = False
-            for i in range(60):
-                ok, cur = check_url(sb, "hcnsec", tag=f"turnstile_{i}s")
-                if not ok:
-                    result["error"] = f"等待 Turnstile 时被劫持: {cur[:80]}"
-                    return result
-
-                tk = sb.execute_script(r"""
-                    (function() {
-                        const names = [
-                            'cf-turnstile-response',
-                            'cf_turnstile_response',
-                            'turnstile_token',
-                            'g-recaptcha-response',
-                        ];
-                        for (const n of names) {
-                            const el = document.querySelector(`[name="${n}"]`);
-                            if (el && el.value && el.value.length > 20) {
-                                return n + '|' + el.value;
-                            }
-                        }
-                        return '';
-                    })()
-                """)
-                if tk:
-                    field_name, _, val = tk.partition('|')
-                    print(f"✅ Turnstile token: 字段名={field_name} 长度={len(val)}")
-                    turnstile_ok = True
-                    break
-                if i % 10 == 9:
-                    print(f"  ⏳ 等待 Turnstile token… {i+1}s")
-                    try:
-                        sb.uc_gui_click_captcha()
-                    except Exception:
-                        pass
-                sb.sleep(1)
-
-            if not turnstile_ok:
-                print("❌ Turnstile 60s 内未生成 token，放弃登录")
-                try:
-                    sb.save_screenshot("turnstile_timeout.png")
-                except Exception:
-                    pass
-                result["error"] = "Turnstile 未通过"
-                return result
-
-            # ---------- 定位登录按钮 ----------
+            # ---------- ★★★ 关键改动：直接点登录按钮 ----------
+            # 不再调用 uc_gui_click_captcha（它乱点屏幕）
+            # 直接点登录按钮，观察 Turnstile 是否会自动渲染
             print("🖱️ 定位登录按钮…")
             login_sel, login_text = find_login_button(sb)
             if not login_sel:
@@ -580,35 +431,87 @@ def browser_checkin():
                 return result
 
             print(f"  已定位: {login_sel}  文字='{login_text}'")
-            # 也用 JS 原生 click 提交
+
+            # 点击前先检查是否已经有 Turnstile
+            pre_turnstile = sb.execute_script("""
+                var out = [];
+                out.push('iframe=' + document.querySelectorAll('iframe').length);
+                out.push('cf-turnstile=' + document.querySelectorAll('.cf-turnstile').length);
+                var tk = document.querySelector('[name="cf-turnstile-response"]');
+                out.push('resp=' + (tk ? ('len:' + (tk.value||'').length) : 'NONE'));
+                return out.join('|');
+            """)
+            print(f"  点击登录前 Turnstile 状态: {pre_turnstile}")
+
+            # 用 JS 原生 click 提交
+            print("🖱️ 点击登录按钮 (JS native click)…")
             sb.execute_script("""
                 var btn = document.querySelector("button[type='submit']");
                 if (btn) btn.click();
             """)
-            sb.sleep(1.5)
+            sb.sleep(3)
 
+            # 检查 URL 是否被劫持
             ok, cur = check_url(sb, "hcnsec", tag="after_login_click")
             if not ok:
-                result["error"] = f"登录后跳到异常域名: {cur[:80]}"
+                result["error"] = f"登录按钮点击后跳到异常域名: {cur[:80]}"
                 return result
 
-            # ---------- 等待登录跳转 ----------
-            print("⏳ 等待登录跳转…")
+            print(f"  点击后 URL: {cur}")
+
+            # 检查 Turnstile 是否渲染
+            post_turnstile = sb.execute_script("""
+                var out = [];
+                out.push('iframe=' + document.querySelectorAll('iframe').length);
+                out.push('cf-turnstile=' + document.querySelectorAll('.cf-turnstile').length);
+                var tk = document.querySelector('[name="cf-turnstile-response"]');
+                out.push('resp=' + (tk ? ('len:' + (tk.value||'').length) : 'NONE'));
+                var ifr = document.querySelectorAll('iframe');
+                for (var j=0; j<ifr.length; j++) {
+                    out.push('iframe['+j+']=' + (ifr[j].src||'').slice(0,100));
+                }
+                return out.join('|');
+            """)
+            print(f"  点击登录后 Turnstile 状态: {post_turnstile}")
+
+            try:
+                sb.save_screenshot("after_login_click.png")
+            except Exception:
+                pass
+
+            # ---------- 等待登录跳转或 Turnstile 完成 ----------
+            print("⏳ 等待登录结果…")
             logged_in = False
-            for i in range(30):
-                sb.sleep(2)
+            for i in range(60):
+                sb.sleep(1)
                 cur = sb.get_current_url()
+
+                # 被劫持
+                if "hcnsec" not in cur:
+                    print(f"❌ 等待过程中跳到异常域名: {cur}")
+                    try:
+                        sb.save_screenshot("jumped_away.png")
+                    except Exception:
+                        pass
+                    result["error"] = f"等待过程中被劫持: {cur[:80]}"
+                    return result
+
+                # 成功
                 if "hcnsec" in cur and LOGIN_PATH not in cur and "/login" not in cur:
                     logged_in = True
                     print(f"✅ 登录成功: {cur}")
                     break
-                if "hcnsec" not in cur:
-                    print(f"❌ 登录过程中跳到异常域名: {cur}")
-                    try:
-                        sb.save_screenshot("login_jumped_away.png")
-                    except Exception:
-                        pass
-                    break
+
+                # 检查 Turnstile token（如果出现）
+                tk = sb.execute_script("""
+                    var el = document.querySelector('[name="cf-turnstile-response"]');
+                    return (el && el.value) ? el.value.length : 0;
+                """)
+                if tk and tk > 20:
+                    print(f"  ✅ Turnstile token 出现 (长度={tk})，继续等待跳转…")
+
+                if i % 10 == 9:
+                    print(f"  ⏳ 已等待 {i+1}s，当前 URL: {cur}")
 
             if not logged_in:
                 print("❌ 登录未成功")
@@ -634,7 +537,7 @@ def browser_checkin():
                 result["error"] = "登录状态失效（打开 profile 被重定向回登录页）"
                 return result
 
-            # ---------- 检测按钮状态 ----------
+            # ---------- 检测签到按钮状态 ----------
             print("🔍 检测签到按钮状态…")
             info = find_checkin_button(sb)
             print(f"  按钮状态: {json.dumps(info, ensure_ascii=False)}")
@@ -667,58 +570,29 @@ def browser_checkin():
                 try:
                     with open("no_checkin_button.html", "w", encoding="utf-8") as f:
                         f.write(sb.get_page_source())
-                    print("  已保存页面源码到 no_checkin_button.html")
-                except Exception as e:
-                    print(f"  保存源码失败: {e}")
-                return result
-
-            print(f"  ✅ 找到'立即签到'按钮，开始签到…")
-            print(f"    匹配元素: tag={info.get('tag')} is_button={info.get('is_button')} text='{info.get('text')}'")
-
-            # 用 JS 原生 click 避免坐标问题
-            try:
-                sb.execute_script("""
-                    var el = document.querySelector("[data-checkin-target='1']");
-                    if (!el) return false;
-                    var target = el;
-                    if (el.tagName !== 'BUTTON') {
-                        var innerBtn = el.querySelector('button');
-                        if (innerBtn) target = innerBtn;
-                    }
-                    target.click();
-                """)
-                result["checkin_clicked"] = True
-                print("✅ 已点击 (JS native click)")
-            except Exception as e:
-                print(f"  ⚠️ 点击异常: {e}")
-
-            print("⏳ 等待 CF 弹窗渲染（3 秒）…")
-            sb.sleep(3)
-
-            print("🔐 尝试处理 CF 验证…")
-            for attempt in range(3):
-                try:
-                    sb.uc_gui_click_captcha()
                 except Exception:
                     pass
-                sb.sleep(3)
+                return result
+
+            # ---------- 执行签到 ----------
+            print(f"  ✅ 找到'立即签到'按钮，开始签到…")
+
+            # 用 JS 原生 click
+            sb.execute_script("""
+                var el = document.querySelector("[data-checkin-target='1']");
+                if (!el) return false;
+                var target = el;
+                if (el.tagName !== 'BUTTON') {
+                    var innerBtn = el.querySelector('button');
+                    if (innerBtn) target = innerBtn;
+                }
+                target.click();
+            """)
+            result["checkin_clicked"] = True
+            print("✅ 已点击 (JS native click)")
 
             print("⏳ 等待签到请求完成（15 秒）…")
             sb.sleep(15)
-
-            after_info = find_checkin_button(sb)
-            if after_info.get("state") == "ready":
-                print("  ⚠️ JS click 后按钮状态未变，再试一次 JS click…")
-                sb.execute_script("""
-                    var el = document.querySelector("[data-checkin-target='1']");
-                    if (el) el.click();
-                """)
-                sb.sleep(12)
-                try:
-                    sb.uc_gui_click_captcha()
-                except Exception:
-                    pass
-                sb.sleep(5)
 
             print("💰 读取签到奖励金额…")
             award_text, award_amount = read_award_amount(sb)
