@@ -102,7 +102,7 @@ jobs:
                                             "public_key": params.get('pbk', [''])[0],
                                             "short_id": params.get('sid', [''])[0]}
 
-          # ★★★ 关键：只屏蔽 s0-greate 广告，放行 Turnstile
+          # ★ 只屏蔽广告，放行 Turnstile
           config = {
               "log": {"level": "warn"},
               "inbounds": [
@@ -117,7 +117,6 @@ jobs:
               ],
               "route": {
                   "rules": [
-                      # ★ 只屏蔽广告/追踪，放行 challenges.cloudflare.com
                       {"domain": [
                           "s0-greate.net",
                           "www.s0-greate.net",
