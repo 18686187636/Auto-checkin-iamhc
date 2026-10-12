@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v25-hcnsec: 主动渲染签到 Turnstile 获取 token
+# v26-hcnsec: sitekey 多级提取 + 硬编码 fallback
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -20,6 +20,9 @@ TZ_CN = timezone(timedelta(hours=8))
 LOGIN_URL  = f"{BASE_URL}/sign-in"
 LOGIN_PATH = "/sign-in"
 PROFILE_URL = f"{BASE_URL}/profile"
+
+# ★ 已知 sitekey（从前面的登录日志提取到）
+KNOWN_SITEKEY = "0x4AAAAAAFIovBqwE9xMkrm_"
 
 
 def _requests_proxies():
@@ -90,23 +93,81 @@ def get_turnstile_state(sb):
 
 
 # ============================================================
-# ★★★ v25: 主动渲染签到 Turnstile
+# ★★★ v26: sitekey 多级提取
 # ============================================================
 
 def extract_sitekey(sb):
-    """从网络请求里提取 sitekey"""
+    """从多个来源提取 sitekey"""
+    print("    🔍 尝试提取 sitekey…")
+
+    # 方法 1: Performance entries
     try:
         sk = sb.execute_script(r"""
             var urls = performance.getEntriesByType('resource');
             for (var i = 0; i < urls.length; i++) {
                 var m = urls[i].name.match(/\/(0x[A-Za-z0-9_-]{10,})\//);
-                if (m) return m[1];
+                if (m) return 'PERF:' + m[1];
             }
             return '';
         """)
-        return sk or ""
-    except Exception:
-        return ""
+        if sk:
+            print(f"      方法1(Performance): {sk}")
+            return sk.split(":", 1)[1]
+    except Exception as e:
+        print(f"      方法1 异常: {e}")
+
+    # 方法 2: HTML 内容
+    try:
+        sk = sb.execute_script(r"""
+            var html = document.documentElement.outerHTML;
+            var m = html.match(/0x[A-Za-z0-9_-]{15,}/);
+            return m ? 'HTML:' + m[0] : '';
+        """)
+        if sk:
+            print(f"      方法2(HTML): {sk}")
+            return sk.split(":", 1)[1]
+    except Exception as e:
+        print(f"      方法2 异常: {e}")
+
+    # 方法 3: script 标签内容
+    try:
+        sk = sb.execute_script(r"""
+            var scripts = document.querySelectorAll('script');
+            for (var i = 0; i < scripts.length; i++) {
+                var t = scripts[i].textContent || '';
+                var m = t.match(/0x[A-Za-z0-9_-]{15,}/);
+                if (m) return 'SCRIPT:' + m[0];
+            }
+            return '';
+        """)
+        if sk:
+            print(f"      方法3(Script): {sk}")
+            return sk.split(":", 1)[1]
+    except Exception as e:
+        print(f"      方法3 异常: {e}")
+
+    # 方法 4: window 变量扫描
+    try:
+        sk = sb.execute_script(r"""
+            var keys = ['__TURNSTILE_SITEKEY', 'TURNSTILE_SITEKEY', 'TURNSTILE_KEY',
+                        '__SITE_KEY', 'SITE_KEY', 'SITEKEY'];
+            for (var i = 0; i < keys.length; i++) {
+                var v = window[keys[i]];
+                if (typeof v === 'string' && v.indexOf('0x') === 0) {
+                    return 'WIN.' + keys[i] + ':' + v;
+                }
+            }
+            return '';
+        """)
+        if sk:
+            print(f"      方法4(window): {sk}")
+            return sk.split(":", 1)[1]
+    except Exception as e:
+        print(f"      方法4 异常: {e}")
+
+    # 方法 5: 用硬编码的 sitekey（登录时提取到的）
+    print(f"      方法5(硬编码 fallback): {KNOWN_SITEKEY}")
+    return KNOWN_SITEKEY
 
 
 def ensure_turnstile_token(sb):
@@ -128,7 +189,7 @@ def ensure_turnstile_token(sb):
     if not sitekey:
         print("    ❌ 无法提取 sitekey")
         return False
-    print(f"    sitekey={sitekey}")
+    print(f"    ✅ 使用 sitekey={sitekey}")
 
     # 3. 主动渲染
     print("    主动渲染 Turnstile widget…")
@@ -212,13 +273,13 @@ def ensure_turnstile_token(sb):
 
 
 def direct_fetch_checkin(sb, token):
-    """★ 直接用 fetch 调用签到 API（绕过按钮 React 逻辑）"""
+    """直接用 fetch 调用签到 API"""
     print("    📮 直接用 fetch 调签到 API…")
     try:
         r = sb.execute_script("""
             var token = arguments[0];
             var xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/user/checkin', false);  // 同步
+            xhr.open('POST', '/api/user/checkin', false);
             xhr.setRequestHeader('Content-Type', 'application/json');
             xhr.withCredentials = true;
             try {
@@ -344,7 +405,6 @@ def wait_for_checkin_button(sb, max_wait=40):
 
 
 def click_checkin_button(sb):
-    """点击签到按钮"""
     try:
         sb.execute_script("""
             var arr = document.querySelectorAll("button");
@@ -406,7 +466,6 @@ def browser_checkin():
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(5)
 
-            # 等 React
             print("⏳ 等待 React 渲染完成…")
             for i in range(20):
                 ok, cur = check_url(sb, "hcnsec", tag="open")
@@ -421,7 +480,6 @@ def browser_checkin():
                 result["error"] = "React 未渲染"
                 return result
 
-            # 等 Turnstile
             print("\n⏳ 等待 Turnstile api.js 初始化…")
             for i in range(15):
                 st = get_turnstile_state(sb)
@@ -430,7 +488,6 @@ def browser_checkin():
                     break
                 sb.sleep(1)
 
-            # 填表
             print("\n✍️ 填写表单…")
             def react_fill(name, value):
                 payload = json.dumps({"name": name, "value": value})
@@ -451,7 +508,6 @@ def browser_checkin():
             print(f"  password fill: {react_fill('password', PASSWORD)}")
             sb.sleep(0.5)
 
-            # 勾选
             print("☑️ 勾选法律同意…")
             consent_sel = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
             try:
@@ -462,7 +518,6 @@ def browser_checkin():
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
-            # 点 Turnstile
             print("\n🎯 点击登录 Turnstile…")
             token_ok = False
             for attempt in range(5):
@@ -496,7 +551,6 @@ def browser_checkin():
                 result["error"] = "Turnstile token 未出现"
                 return result
 
-            # 点登录
             print("\n🖱️ 点击登录按钮…")
             try:
                 login_btn = sb.find_element("button[type='submit']")
@@ -516,7 +570,6 @@ def browser_checkin():
                 result["error"] = f"登录后跳到异常域名: {cur[:80]}"
                 return result
 
-            # 等跳转
             print("⏳ 等待登录结果…")
             logged_in = False
             for i in range(30):
@@ -538,7 +591,6 @@ def browser_checkin():
             result["logged_in"] = True
             sb.sleep(3)
 
-            # 打开 profile
             print("📄 打开个人资料页面…")
             safe_goto(sb, PROFILE_URL, tag="profile")
             sb.sleep(3)
@@ -550,7 +602,6 @@ def browser_checkin():
 
             print(f"  当前页面: {cur}")
 
-            # 等签到按钮
             info = wait_for_checkin_button(sb, max_wait=40)
             if info.get("hijacked"):
                 result["error"] = f"等待按钮时被劫持: {info['hijacked'][:80]}"
@@ -581,12 +632,11 @@ def browser_checkin():
                 result["error"] = "未找到签到按钮"
                 return result
 
-            # ============================================================
-            # ★★★ v25 核心：先获取 Turnstile token，再点击签到
-            # ============================================================
             print(f"  ✅ 找到'立即签到'按钮")
 
-            # 步骤 1: 主动渲染 Turnstile widget
+            # ============================================================
+            # ★ v26: 主动渲染 Turnstile → 点击 → fetch 兜底
+            # ============================================================
             print("\n🎯 步骤 1: 主动渲染签到 Turnstile…")
             token_ok = ensure_turnstile_token(sb)
 
@@ -596,22 +646,19 @@ def browser_checkin():
                 result["error"] = "签到 Turnstile token 获取失败"
                 return result
 
-            # 步骤 2: 点击签到按钮
             print("\n🎯 步骤 2: 点击签到按钮…")
             click_ok = click_checkin_button(sb)
             result["checkin_clicked"] = True
             print(f"  点击结果: {click_ok}")
 
-            # 步骤 3: 等 4s 看结果
-            print("\n⏳ 步骤 3: 等待 4s…")
-            sb.sleep(4)
+            print("\n⏳ 步骤 3: 等待 5s…")
+            sb.sleep(5)
 
-            # 检查按钮状态
             new_state = find_checkin_state(sb)
             st = new_state.get("state", "?")
             print(f"  按钮状态: {st}")
 
-            # 如果没变，用 API 直接调用
+            # 如果按钮没变，用 API 直接调用
             if st != "already":
                 print("\n🎯 步骤 4: 按钮未变，直接用 fetch 调 API…")
                 try:
@@ -619,16 +666,14 @@ def browser_checkin():
                     if token and len(token) > 20:
                         direct_fetch_checkin(sb, token)
                         sb.sleep(3)
-                        # 重新加载页面
                         print("  重新加载 profile 页面…")
                         safe_goto(sb, PROFILE_URL, tag="profile-reload")
                         sb.sleep(5)
                     else:
-                        print("  ⚠️ 无 token 可用")
+                        print(f"  ⚠️ 无 token 可用 (len={len(token) if token else 0})")
                 except Exception as e:
                     print(f"  fetch 异常: {e}")
 
-            # 等结果
             print("\n🔍 检查最终状态…")
             new_state = find_checkin_state(sb)
             result["button_after"] = new_state.get("text", "")
