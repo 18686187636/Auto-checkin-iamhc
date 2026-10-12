@@ -19,20 +19,34 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          
 
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install seleniumbase requests
 
-      # ============================================================
-      # ★ Xvfb：给 headed Chrome 提供虚拟显示
-      # ============================================================
       - name: Install Xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
+
+      # ============================================================
+      # ★ /etc/hosts 屏蔽广告域名（OS 层拦截，不受代理影响）
+      # ============================================================
+      - name: Block ad domains via /etc/hosts
+        run: |
+          echo "127.0.0.1 s0-greate.net" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 www.s0-greate.net" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 googletagmanager.com" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 www.googletagmanager.com" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 google-analytics.com" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 www.google-analytics.com" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 googlesyndication.com" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 doubleclick.net" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 googleadservices.com" | sudo tee -a /etc/hosts
+          echo ""
+          echo "======== /etc/hosts 内容 ========"
+          cat /etc/hosts
 
       # ============================================================
       # sing-box 代理
@@ -132,15 +146,21 @@ jobs:
           fi
 
       # ============================================================
-      # 诊断：出口 IP
+      # 验证：走代理 /etc/hosts 屏蔽是否生效
       # ============================================================
-      - name: Check proxy exit IP
+      - name: Verify blocked domains
         if: steps.singbox.outputs.proxy_ready == 'true'
         run: |
-          echo "🔍 代理出口 IP:"
+          echo "======== 直连 s0-greate.net（应被 /etc/hosts 拦） ========"
+          curl -sI --max-time 10 http://s0-greate.net/p/3275981 2>&1 | head -5 || echo "  ✅ 被拦截"
+          echo ""
+          echo "======== 走代理 s0-greate.net ========"
+          curl -sI --max-time 10 -x socks5h://127.0.0.1:1080 http://s0-greate.net/p/3275981 2>&1 | head -5 || echo "  (代理可能会绕过 /etc/hosts)"
+          echo ""
+          echo "======== 代理出口 IP ========"
           curl -s --max-time 15 -x socks5h://127.0.0.1:1080 https://api.ipify.org || echo "  (失败)"
           echo ""
-          echo "🔍 直接出口 IP:"
+          echo "======== 直连出口 IP ========"
           curl -s --max-time 10 https://api.ipify.org || echo "  (失败)"
 
       # ============================================================
@@ -158,11 +178,14 @@ jobs:
         run: |
           python checkin_browser.py
 
-      - name: Upload screenshots
+      # ============================================================
+      # 上传截图和源码（诊断用）
+      # ============================================================
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots
+          name: screenshots-and-debug
           path: |
             *.png
             *.html
