@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+# v2-hcnsec: Turnstile 硬检查 + 精确登录按钮定位 + 域名校验
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -32,6 +32,51 @@ def send_notification(message):
             print("Telegram 异常:", e)
 
 
+# ============================================================
+# ★★★ 新增：精确查找登录按钮
+# ============================================================
+def find_login_button(sb):
+    """
+    在页面里精确定位登录按钮。返回 (定位符, 元素文本) 或 (None, None)。
+    只考虑表单内的 submit 按钮，或文字明确是"登录/Sign in"的按钮。
+    排除"搜索/订阅"等明显无关按钮。
+    """
+    candidates = [
+        "//form//button[@type='submit']",
+        "//form//button[contains(., '登录')]",
+        "//form//button[contains(., 'Sign in')]",
+        "//form//button[contains(., 'Sign In')]",
+        "//form//button[contains(., 'Login')]",
+        "//button[@type='submit' and contains(., '登录')]",
+        "//button[@type='submit' and contains(., 'Sign in')]",
+        "//button[@type='submit' and contains(., 'Sign In')]",
+        "//button[@type='submit' and contains(., 'Login')]",
+        "//button[contains(., '登录')]",
+        "//button[contains(., 'Sign in')]",
+        "//button[contains(., 'Sign In')]",
+        "//button[contains(., 'Login')]",
+    ]
+    # 明确排除的关键词（防止误点搜索/订阅/注册）
+    exclude_keywords = ("搜索", "Search", "订阅", "Subscribe",
+                        "注册", "Sign up", "Sign Up", "Register")
+    for sel in candidates:
+        try:
+            elems = sb.find_elements(sel)
+            for el in elems:
+                try:
+                    if not el.is_displayed() or not el.is_enabled():
+                        continue
+                except Exception:
+                    continue
+                txt = (el.text or "").strip()
+                if any(k in txt for k in exclude_keywords):
+                    continue
+                return sel, txt
+        except Exception:
+            continue
+    return None, None
+
+
 def read_award_amount(sb):
     """读取“每日签到”卡片内的今日奖励金额，并打印所有候选元素用于诊断"""
     debug_info = sb.execute_script("""
@@ -60,19 +105,19 @@ def read_award_amount(sb):
             return JSON.stringify(results);
         })()
     """)
-    
+
     print(f"    🔍 诊断：页面所有 '今天 +¥' 元素")
     try:
         candidates = json.loads(debug_info) if debug_info else []
     except Exception:
         candidates = []
-    
+
     if not candidates:
         print("      ⚠️ 未找到任何 '今天 +¥' 元素")
     for i, c in enumerate(candidates):
         print(f"      [{i}] <{c['tag']}> class='{c['cls'][:80]}...' "
               f"card='{c['cardTitle']}' text='{c['text']}'")
-    
+
     award_text = ""
     for c in candidates:
         if c.get("cardTitle") == "每日签到":
@@ -85,12 +130,12 @@ def read_award_amount(sb):
                 break
     if not award_text and candidates:
         award_text = candidates[0]["text"]
-    
+
     amount = ""
     m = re.search(r'[+＋]\s*¥\s*([\d.]+)', award_text or "")
     if m:
         amount = m.group(1)
-    
+
     return award_text, amount
 
 
@@ -113,7 +158,6 @@ def find_checkin_button(sb):
                 const isBtn = (e.tagName === 'BUTTON');
 
                 if (t.includes('立即签到')) {
-                    // 优先 button；否则选文本最短的
                     if (!bestImmediate) {
                         bestImmediate = {el: e, text: t, isButton: isBtn};
                     } else {
@@ -140,7 +184,6 @@ def find_checkin_button(sb):
             }
 
             if (bestImmediate) {
-                // 在真实按钮上打标记；如果是非 button，也要打标记并让点击落在最内层
                 bestImmediate.el.setAttribute('data-checkin-target', '1');
                 return JSON.stringify({
                     state: 'ready',
@@ -157,7 +200,6 @@ def find_checkin_button(sb):
                 });
             }
 
-            // 诊断信息
             const checkinElems = [];
             allElems.forEach(e => {
                 const t = (e.textContent || '').trim();
@@ -208,7 +250,7 @@ def browser_checkin():
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
     ) as sb:
         try:
-            # ---------- 登录 ----------
+            # ---------- 打开登录页 ----------
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
@@ -233,6 +275,15 @@ def browser_checkin():
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
+            # ---------- 保存登录页源码（诊断用） ----------
+            try:
+                with open("login_page_source.html", "w", encoding="utf-8") as f:
+                    f.write(sb.get_page_source())
+                print("  📄 已保存登录页源码到 login_page_source.html")
+            except Exception as e:
+                print(f"  保存登录页源码失败: {e}")
+
+            # ---------- Turnstile ----------
             print("⏳ 等待登录 Turnstile…")
             sb.sleep(5)
             try:
@@ -240,33 +291,105 @@ def browser_checkin():
             except Exception as e:
                 print(f"  click_captcha 异常: {e}")
 
+            # ★★★ 硬检查：60s 内没拿到 token 就放弃
+            turnstile_ok = False
             for i in range(60):
                 tk = sb.execute_script(
                     'return (document.querySelector(\'[name="cf-turnstile-response"]\') || {}).value || "";'
                 )
                 if tk:
                     print(f"✅ 登录 Turnstile token 长度: {len(tk)}")
+                    turnstile_ok = True
                     break
                 sb.sleep(1)
 
-            print("🖱️ 点击登录按钮…")
-            sb.wait_for_element_visible("button[type='submit']", timeout=10)
-            sb.click("button[type='submit']")
+            if not turnstile_ok:
+                print("❌ Turnstile 60s 内未生成 token，放弃登录")
+                try:
+                    sb.save_screenshot("turnstile_timeout.png")
+                except Exception:
+                    pass
+                result["error"] = "Turnstile 未通过"
+                return result
 
+            # ---------- 定位登录按钮 ----------
+            print("🖱️ 定位登录按钮…")
+            try:
+                all_submits = sb.execute_script("""
+                    (function() {
+                        const out = [];
+                        document.querySelectorAll("button[type='submit']").forEach(function(b) {
+                            out.push({
+                                text: (b.textContent || '').trim().slice(0, 40),
+                                visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+                                inForm: !!b.closest('form'),
+                                cls: (b.className || '').slice(0, 60)
+                            });
+                        });
+                        return JSON.stringify(out);
+                    })()
+                """)
+                print(f"  页面所有 submit 按钮: {all_submits}")
+            except Exception as e:
+                print(f"  诊断异常: {e}")
+
+            login_sel, login_text = find_login_button(sb)
+            if not login_sel:
+                print("❌ 未找到登录按钮")
+                try:
+                    sb.save_screenshot("no_login_button.png")
+                except Exception:
+                    pass
+                result["error"] = "未找到登录按钮"
+                return result
+
+            print(f"  已定位: {login_sel}  文字='{login_text}'")
+            sb.click(login_sel)
+            sb.sleep(1.5)
+
+            # ---------- 立即校验域名 ----------
+            cur_check = sb.get_current_url()
+            print(f"  点击后 URL: {cur_check}")
+            if "hcnsec" not in cur_check:
+                print(f"❌ 登录按钮点击后跳到异常域名: {cur_check}")
+                print("   可能是点错了按钮或代理劫持")
+                try:
+                    sb.save_screenshot("login_wrong_redirect.png")
+                except Exception:
+                    pass
+                result["error"] = f"登录后跳到异常域名: {cur_check[:80]}"
+                return result
+
+            # ---------- 等待登录跳转 ----------
             print("⏳ 等待登录跳转…")
+            logged_in = False
             for i in range(30):
                 sb.sleep(2)
                 cur = sb.get_current_url()
-                if LOGIN_PATH not in cur:
-                    result["logged_in"] = True
+                # 必须回到 hcnsec 域名，且不含 sign-in/login
+                if "hcnsec" in cur and LOGIN_PATH not in cur and "/login" not in cur:
+                    logged_in = True
                     print(f"✅ 登录成功: {cur}")
                     break
-            if not result["logged_in"]:
-                print("❌ 登录未跳转")
-                sb.save_screenshot("login_failed.png")
+                # 跳到其他域名 → 立即中止
+                if "hcnsec" not in cur:
+                    print(f"❌ 登录过程中跳到异常域名: {cur}")
+                    try:
+                        sb.save_screenshot("login_jumped_away.png")
+                    except Exception:
+                        pass
+                    break
+
+            if not logged_in:
+                print("❌ 登录未成功")
+                try:
+                    sb.save_screenshot("login_failed.png")
+                except Exception:
+                    pass
                 result["error"] = "登录失败"
                 return result
 
+            result["logged_in"] = True
             sb.sleep(3)
 
             # ---------- 打开个人资料页 ----------
@@ -275,8 +398,11 @@ def browser_checkin():
             sb.sleep(6)
             cur = sb.get_current_url()
             print(f"  当前页面: {cur}")
-            if "sign-in" in cur or "login" in cur:
-                result["error"] = "登录状态失效"
+            if "sign-in" in cur or "/login" in cur:
+                result["error"] = "登录状态失效（打开 profile 被重定向回登录页）"
+                return result
+            if "hcnsec" not in cur:
+                result["error"] = f"打开 profile 跳到异常域名: {cur[:80]}"
                 return result
 
             # ---------- 检测按钮状态 ----------
@@ -323,7 +449,6 @@ def browser_checkin():
             print(f"  ✅ 找到'立即签到'按钮，开始签到…")
             print(f"    匹配元素: tag={info.get('tag')} is_button={info.get('is_button')} text='{info.get('text')}'")
 
-            # 首选方式：uc_click
             try:
                 sb.uc_click("[data-checkin-target='1']", reconnect_time=2)
                 result["checkin_clicked"] = True
@@ -331,7 +456,6 @@ def browser_checkin():
             except Exception as e:
                 print(f"  ⚠️ uc_click 异常: {e}")
 
-            # 等待并检查按钮状态是否变化
             print("⏳ 等待 CF 弹窗渲染（3 秒）…")
             sb.sleep(3)
 
@@ -346,16 +470,13 @@ def browser_checkin():
             print("⏳ 等待签到请求完成（15 秒）…")
             sb.sleep(15)
 
-            # 检查按钮是否已变成"已签到"
             after_info = find_checkin_button(sb)
             if after_info.get("state") == "ready":
-                # 还是"立即签到"，说明 uc_click 没生效，尝试 JS 直接 click
                 print("  ⚠️ uc_click 后按钮状态未变，尝试 JS 直接 click…")
                 js_clicked = sb.execute_script("""
                     (function() {
                         const el = document.querySelector("[data-checkin-target='1']");
                         if (!el) return false;
-                        // 找到最内层可点击的 button
                         let target = el;
                         if (el.tagName !== 'BUTTON') {
                             const innerBtn = el.querySelector('button');
@@ -371,7 +492,6 @@ def browser_checkin():
                 print("⏳ 再次等待签到请求完成（12 秒）…")
                 sb.sleep(12)
 
-                # 再试一次 CF
                 try:
                     sb.uc_gui_click_captcha()
                 except Exception:
@@ -417,7 +537,7 @@ def main():
     r = browser_checkin()
 
     if not r.get("logged_in"):
-        msg = f"❌ iamhc 登录失败\n⏱️ {now}"
+        msg = f"❌ iamhc 登录失败\n📌 {r.get('error', '')}\n⏱️ {now}"
         print(msg)
         send_notification(msg)
         sys.exit(1)
