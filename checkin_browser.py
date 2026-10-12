@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v6-hcnsec: 白名单模式屏蔽第三方 + list 传参修复
+# v7-hcnsec: CDP 网络屏蔽 + 每步 URL 校验
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -21,25 +21,16 @@ LOGIN_URL  = f"{BASE_URL}/sign-in"
 LOGIN_PATH = "/sign-in"
 PROFILE_URL = f"{BASE_URL}/profile"
 
-# ★★★ v6: 白名单模式 —— 只允许这些域名解析，其他全部 MAP 到 0.0.0.0
-ALLOWED_HOSTS = [
-    "api.hcnsec.cn",
-    "*.hcnsec.cn",
-    "*.cloudflare.com",           # Turnstile 需要
-    "cloudflare.com",
-    "api.ipify.org",              # 用于诊断出口 IP
-]
-
-# 额外的黑名单（冗余保险，不会被 host-resolver-rules 拆分影响）
-BLOCKED_DOMAINS = [
-    "s0-greate.net",
-    "www.googletagmanager.com",
-    "googletagmanager.com",
-    "www.google-analytics.com",
-    "google-analytics.com",
-    "pagead2.googlesyndication.com",
-    "doubleclick.net",
-    "googlesyndication.com",
+# ★★★ v7: 用 CDP 屏蔽的 URL pattern
+BLOCKED_PATTERNS = [
+    "*s0-greate.net*",
+    "*googletagmanager.com*",
+    "*google-analytics.com*",
+    "*googlesyndication.com*",
+    "*doubleclick.net*",
+    "*googleadservices.com*",
+    "*adservice.google*",
+    "*pagead2*",
 ]
 
 
@@ -65,6 +56,19 @@ def send_notification(message):
             print("Telegram:", "成功" if r.status_code == 200 else f"失败 {r.status_code}")
         except Exception as e:
             print("Telegram 异常:", e)
+
+
+def check_url(sb, expected_contains="hcnsec", tag=""):
+    """检查当前 URL 是否仍在预期域名，不在就返回 False"""
+    cur = sb.get_current_url()
+    if expected_contains not in cur:
+        print(f"❌ [{tag}] URL 被劫持到: {cur}")
+        try:
+            sb.save_screenshot(f"hijacked_{tag}.png")
+        except Exception:
+            pass
+        return False, cur
+    return True, cur
 
 
 def find_login_button(sb):
@@ -261,20 +265,8 @@ def browser_checkin():
 
     print("🚀 启动浏览器（UC 模式）…")
 
-    # ★★★ v6 关键修复：chromium_arg 用 LIST 传递，逗号不会被切
-    #   白名单模式：MAP * 0.0.0.0 屏蔽所有域名，EXCLUDE 放行必要域名
-    resolver_rules = "MAP * 0.0.0.0"
-    for host in ALLOWED_HOSTS:
-        resolver_rules += f", EXCLUDE {host}"
-
-    chromium_args_list = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-blink-features=AutomationControlled",
-        f"--host-resolver-rules={resolver_rules}",
-    ]
-
+    # ★★★ v7: chromium_arg 用字符串（SeleniumBase 签名）
+    #   不再用 host-resolver-rules（逗号会被切），改用 CDP 屏蔽
     sb_kwargs = dict(
         uc=True,
         headed=True,
@@ -282,7 +274,7 @@ def browser_checkin():
         incognito=True,
         locale_code="zh-CN",
         window_size="1920,1080",
-        chromium_arg=chromium_args_list,   # ★ 用 list，不用逗号字符串
+        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled",
     )
     if CHROME_PROXY:
         print(f"🌐 浏览器代理: {CHROME_PROXY}")
@@ -295,28 +287,33 @@ def browser_checkin():
     else:
         print("🌐 requests 代理: 未启用（直连）")
 
-    print(f"🚫 白名单模式：仅放行 {', '.join(ALLOWED_HOSTS)}")
-    print(f"   其他域名全部解析失败（拦截所有广告脚本）")
-
     with SB(**sb_kwargs) as sb:
         try:
+            # ★★★ v7: 用 CDP 屏蔽广告/追踪请求
+            print("🛡️ 启用 CDP 网络屏蔽…")
+            try:
+                sb.driver.execute_cdp_cmd("Network.enable", {})
+                sb.driver.execute_cdp_cmd("Network.setBlockedURLs", {
+                    "urls": BLOCKED_PATTERNS
+                })
+                print(f"   ✅ 已屏蔽 {len(BLOCKED_PATTERNS)} 条规则:")
+                for p in BLOCKED_PATTERNS:
+                    print(f"      - {p}")
+            except Exception as e:
+                print(f"   ⚠️ CDP 屏蔽失败: {e}")
+
             # ---------- 打开登录页 ----------
             print(f"🌐 打开登录页: {LOGIN_URL}")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
             sb.sleep(3)
 
-            # ---------- 等 React 渲染，同时检查是否被劫持 ----------
+            # ---------- 等 React 渲染 + URL 校验 ----------
             print("⏳ 等待 React 渲染完成…")
             react_ready = False
             for i in range(20):
-                cur = sb.get_current_url()
-                if "hcnsec" not in cur:
-                    print(f"❌ 页面被劫持到: {cur}")
-                    try:
-                        sb.save_screenshot("hijacked.png")
-                    except Exception:
-                        pass
-                    result["error"] = f"页面被劫持: {cur[:80]}"
+                ok, cur = check_url(sb, "hcnsec", tag="open")
+                if not ok:
+                    result["error"] = f"打开页面被劫持: {cur[:80]}"
                     return result
                 has_user = sb.execute_script(
                     "return document.querySelector(\"input[name='username']\") ? 1 : 0;"
@@ -342,12 +339,25 @@ def browser_checkin():
             sb.wait_for_element_visible("input[name='username']", timeout=15)
             sb.wait_for_element_visible("input[name='password']", timeout=10)
 
-            print("✍️ 填写登录凭证…")
+            # ---------- 输入用户名 ----------
+            print("✍️ 填写用户名…")
             sb.type("input[name='username']", EMAIL)
             sb.sleep(0.5)
+            ok, cur = check_url(sb, "hcnsec", tag="after_username")
+            if not ok:
+                result["error"] = f"输入用户名后被劫持: {cur[:80]}"
+                return result
+
+            # ---------- 输入密码 ----------
+            print("✍️ 填写密码…")
             sb.type("input[name='password']", PASSWORD)
             sb.sleep(0.5)
+            ok, cur = check_url(sb, "hcnsec", tag="after_password")
+            if not ok:
+                result["error"] = f"输入密码后被劫持: {cur[:80]}"
+                return result
 
+            # ---------- 勾选同意 ----------
             print("☑️ 勾选法律同意…")
             consent = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
             try:
@@ -358,6 +368,11 @@ def browser_checkin():
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
+            ok, cur = check_url(sb, "hcnsec", tag="after_consent")
+            if not ok:
+                result["error"] = f"勾选同意后被劫持: {cur[:80]}"
+                return result
+
             # 保存源码
             try:
                 with open("login_page_source.html", "w", encoding="utf-8") as f:
@@ -366,7 +381,7 @@ def browser_checkin():
             except Exception as e:
                 print(f"  保存登录页源码失败: {e}")
 
-            # ---------- 浏览器出口 IP ----------
+            # ---------- 出口 IP ----------
             print("🔍 通过浏览器获取出口 IP…")
             try:
                 ip_info = sb.execute_script("""
@@ -383,8 +398,13 @@ def browser_checkin():
             except Exception as e:
                 print(f"  IP 检测失败: {e}")
 
-            # ---------- Turnstile 结构诊断 ----------
+            # ---------- Turnstile 诊断 ----------
             print("🔬 诊断 Turnstile 结构…")
+            ok, cur = check_url(sb, "hcnsec", tag="before_diag")
+            if not ok:
+                result["error"] = f"诊断前被劫持: {cur[:80]}"
+                return result
+
             try:
                 diag = sb.execute_script("""
                     var out = [];
@@ -394,15 +414,6 @@ def browser_checkin():
                     out.push('data-sitekey=' + document.querySelectorAll('[data-sitekey]').length);
                     var tk = document.querySelector('[name="cf-turnstile-response"]');
                     out.push('cf-turnstile-response=' + (tk ? ('len:' + (tk.value||'').length) : 'NONE'));
-                    var allIn = document.querySelectorAll('input,textarea');
-                    var tokNames = [];
-                    for (var i=0; i<allIn.length; i++) {
-                        var n = (allIn[i].name||'').toLowerCase();
-                        if (n.indexOf('token')>=0 || n.indexOf('captcha')>=0 || n.indexOf('turnstile')>=0) {
-                            tokNames.push(allIn[i].name + '=' + (allIn[i].value||'').length);
-                        }
-                    }
-                    out.push('token_inputs=' + tokNames.join(','));
                     var ifr = document.querySelectorAll('iframe');
                     for (var j=0; j<ifr.length; j++) {
                         out.push('iframe['+j+'].src=' + (ifr[j].src||'').slice(0,120));
@@ -429,13 +440,8 @@ def browser_checkin():
 
             turnstile_ok = False
             for i in range(60):
-                cur = sb.get_current_url()
-                if "hcnsec" not in cur:
-                    print(f"❌ Turnstile 等待中被劫持到: {cur}")
-                    try:
-                        sb.save_screenshot("hijacked_during_turnstile.png")
-                    except Exception:
-                        pass
+                ok, cur = check_url(sb, "hcnsec", tag=f"turnstile_{i}s")
+                if not ok:
                     result["error"] = f"等待 Turnstile 时被劫持: {cur[:80]}"
                     return result
 
@@ -451,14 +457,6 @@ def browser_checkin():
                             const el = document.querySelector(`[name="${n}"]`);
                             if (el && el.value && el.value.length > 20) {
                                 return n + '|' + el.value;
-                            }
-                        }
-                        const all = document.querySelectorAll('input[type="hidden"], textarea');
-                        for (const el of all) {
-                            const n = (el.name || '').toLowerCase();
-                            if ((n.includes('token') || n.includes('captcha') || n.includes('turnstile'))
-                                && el.value && el.value.length > 20) {
-                                return el.name + '|' + el.value;
                             }
                         }
                         return '';
@@ -488,25 +486,6 @@ def browser_checkin():
 
             # ---------- 定位登录按钮 ----------
             print("🖱️ 定位登录按钮…")
-            try:
-                all_submits = sb.execute_script("""
-                    (function() {
-                        const out = [];
-                        document.querySelectorAll("button[type='submit']").forEach(function(b) {
-                            out.push({
-                                text: (b.textContent || '').trim().slice(0, 40),
-                                visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
-                                inForm: !!b.closest('form'),
-                                cls: (b.className || '').slice(0, 60)
-                            });
-                        });
-                        return JSON.stringify(out);
-                    })()
-                """)
-                print(f"  页面所有 submit 按钮: {all_submits}")
-            except Exception as e:
-                print(f"  诊断异常: {e}")
-
             login_sel, login_text = find_login_button(sb)
             if not login_sel:
                 print("❌ 未找到登录按钮")
@@ -521,15 +500,9 @@ def browser_checkin():
             sb.click(login_sel)
             sb.sleep(1.5)
 
-            cur_check = sb.get_current_url()
-            print(f"  点击后 URL: {cur_check}")
-            if "hcnsec" not in cur_check:
-                print(f"❌ 登录按钮点击后跳到异常域名: {cur_check}")
-                try:
-                    sb.save_screenshot("login_wrong_redirect.png")
-                except Exception:
-                    pass
-                result["error"] = f"登录后跳到异常域名: {cur_check[:80]}"
+            ok, cur = check_url(sb, "hcnsec", tag="after_login_click")
+            if not ok:
+                result["error"] = f"登录后跳到异常域名: {cur[:80]}"
                 return result
 
             # ---------- 等待登录跳转 ----------
@@ -566,13 +539,12 @@ def browser_checkin():
             print("📄 打开个人资料页面…")
             sb.open(PROFILE_URL)
             sb.sleep(6)
-            cur = sb.get_current_url()
-            print(f"  当前页面: {cur}")
+            ok, cur = check_url(sb, "hcnsec", tag="profile")
+            if not ok:
+                result["error"] = f"打开 profile 跳到异常域名: {cur[:80]}"
+                return result
             if "sign-in" in cur or "/login" in cur:
                 result["error"] = "登录状态失效（打开 profile 被重定向回登录页）"
-                return result
-            if "hcnsec" not in cur:
-                result["error"] = f"打开 profile 跳到异常域名: {cur[:80]}"
                 return result
 
             # ---------- 检测按钮状态 ----------
