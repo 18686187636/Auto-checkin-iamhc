@@ -1,16 +1,15 @@
-name: iamhc Daily Checkin
+name: iamhc 签到
 
 on:
   schedule:
-    - cron: '30 0 * * *'   # UTC 0:30 = 北京时间次日 8:30
+    # UTC 22:00 = 北京时间 06:00
+    - cron: "0 22 * * *"
   workflow_dispatch:
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -19,78 +18,148 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            xvfb \
-            libxi6 \
-            libnss3 \
-            libxss1 \
-            libasound2t64 \
-            libatk-bridge2.0-0 \
-            libatk1.0-0 \
-            libcups2 \
-            libdrm2 \
-            libgbm1 \
-            libgtk-3-0 \
-            libpangocairo-1.0-0 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxfixes3 \
-            libxrandr2 \
-            fonts-liberation \
-            xdg-utils
-
-      - name: Install Google Chrome
-        run: |
-          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo dpkg -i /tmp/chrome.deb || sudo apt-get install -f -y
-          google-chrome --version
-
-      - name: Install Python deps
+      - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install --retries 5 --timeout 60 \
-            -i https://pypi.tuna.tsinghua.edu.cn/simple \
-            seleniumbase requests
+          pip install seleniumbase requests
+          # SeleniumBase 的 UC 模式需要 chromedriver，会自动下载
 
+      # ============================================================
+      # sing-box 代理（用户提供）
+      # ============================================================
+      - name: Configure sing-box proxy
+        id: singbox
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          SING_BOX_VERSION: "1.10.7"
+        run: |
+          set -e
+          if [ -z "$NODE_LINK" ]; then
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64)  SB_ARCH="amd64" ;;
+            aarch64|arm64) SB_ARCH="arm64" ;;
+            *) exit 1 ;;
+          esac
+          PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
+          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
+                 -o sing-box.tar.gz "${PREFIX}${URL}"; then
+              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then break; fi
+              rm -f sing-box.tar.gz
+            fi
+          done
+          tar -xzf sing-box.tar.gz
+          SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
+          sudo mv "$SING_BOX_DIR/sing-box" /usr/local/bin/
+          sudo chmod +x /usr/local/bin/sing-box
+          rm -rf sing-box.tar.gz "$SING_BOX_DIR"
+
+          python3 << 'PYEOF'
+          import json, sys, os, re
+          from urllib.parse import urlparse, parse_qs
+          link = os.environ.get('NODE_LINK', '')
+          parsed = urlparse(link)
+          netloc = parsed.netloc
+          uuid, host_port = netloc.split('@', 1) if '@' in netloc else ('', netloc)
+          host, port = '', '443'
+          bm = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
+          if bm:
+              host = bm.group(1)
+              if bm.group(2): port = bm.group(2)
+          else:
+              if host_port.count(':') > 1: host = host_port
+              elif ':' in host_port: host, port = host_port.split(':', 1)
+              else: host = host_port
+          params = parse_qs(parsed.query)
+          sni = params.get('sni', [''])[0] or host
+          fp = params.get('fp', [''])[0] or 'chrome'
+          flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
+          type_ = params.get('type', ['tcp'])[0]
+          security = params.get('security', [''])[0]
+          path = params.get('path', [''])[0]
+          host_header = params.get('host', [''])[0] or host
+          outbound = {"type": "vless", "tag": "vless-out", "server": host,
+                      "server_port": int(port), "uuid": uuid, "flow": flow,
+                      "packet_encoding": "packetaddr"}
+          if security.lower() != 'none':
+              outbound["tls"] = {"enabled": True, "server_name": sni, "insecure": False,
+                                 "utls": {"enabled": True, "fingerprint": fp}}
+          if type_ != 'tcp':
+              transport = {"type": type_}
+              if type_ == 'ws':
+                  transport["path"] = path or "/"
+                  transport["headers"] = {"Host": host_header}
+              elif type_ == 'grpc':
+                  transport["service_name"] = path or ""
+              outbound["transport"] = transport
+          if security == 'reality':
+              outbound['tls']['reality'] = {"enabled": True,
+                                            "public_key": params.get('pbk', [''])[0],
+                                            "short_id": params.get('sid', [''])[0]}
+          config = {"log": {"level": "warn"},
+                    "inbounds": [
+                        {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                        {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}],
+                    "outbounds": [outbound],
+                    "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}}
+          with open("sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+          PYEOF
+
+          nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
+          sleep 5
+          if ss -tuln 2>/dev/null | grep -q ':1080'; then
+            echo "proxy_ready=true" >> "$GITHUB_OUTPUT"
+            echo "✅ sing-box 代理已启动 (socks5://127.0.0.1:1080)"
+          else
+            cat sing-box.log
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ============================================================
+      # 验证代理出口 IP（诊断用）
+      # ============================================================
+      - name: Check proxy exit IP
+        if: steps.singbox.outputs.proxy_ready == 'true'
+        run: |
+          echo "🔍 代理出口 IP:"
+          curl -s --max-time 15 -x socks5h://127.0.0.1:1080 https://api.ipify.org || echo "  (失败)"
+          echo ""
+          echo "🔍 直接出口 IP:"
+          curl -s --max-time 10 https://api.ipify.org || echo "  (失败)"
+
+      # ============================================================
+      # 运行签到脚本
+      # ============================================================
       - name: Run checkin
+        if: steps.singbox.outputs.proxy_ready == 'true'
         env:
           EMAIL:        ${{ secrets.EMAIL }}
           PASSWORD:     ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-        run: |
-          pkill -f chrome || true
-          sleep 2
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" python checkin_browser.py
 
-      - name: Upload debug artifacts
+          # ★ 代理：Chromium 走 socks5，requests 走 http
+          CHROME_PROXY: socks5://127.0.0.1:1080
+          HTTPS_PROXY:  http://127.0.0.1:1081
+        run: |
+          python hcnsec_checkin.py
+
+      - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
+          name: screenshots
           path: |
-            browser_error.png
-            login_failed.png
-            no_checkin_button.png
-            checkin_result.png
+            *.png
+            *.html
+          retention-days: 3
           if-no-files-found: ignore
-
-      - name: Clear old runs
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "deleted: $run_id"
-              gh run delete $run_id || true
-            fi
-          done
