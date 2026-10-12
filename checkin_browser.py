@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v2-hcnsec: Turnstile 硬检查 + 精确登录按钮定位 + 域名校验
+# v3-hcnsec: Xvfb + headed + 代理支持
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -10,6 +10,16 @@ PASSWORD     = os.environ.get("PASSWORD") or ""
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
+# ============================================================
+# 代理配置
+#   CHROME_PROXY  : 给 Chromium 用，如 socks5://127.0.0.1:1080
+#   HTTPS_PROXY   : 给 requests（Telegram）用，如 http://127.0.0.1:1081
+#   留空则直连
+# ============================================================
+CHROME_PROXY = (os.environ.get("CHROME_PROXY") or "").strip()
+HTTPS_PROXY  = (os.environ.get("HTTPS_PROXY") or
+                os.environ.get("https_proxy") or "").strip()
+
 BASE_URL = "https://api.hcnsec.cn"
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -18,29 +28,34 @@ LOGIN_PATH = "/sign-in"
 PROFILE_URL = f"{BASE_URL}/profile"
 
 
+def _requests_proxies():
+    if not HTTPS_PROXY:
+        return None
+    return {"http": HTTPS_PROXY, "https": HTTPS_PROXY}
+
+
 def send_notification(message):
     print("\n" + "=" * 30)
     print(message)
     print("=" * 30)
     if TG_BOT_TOKEN and TG_CHAT_ID:
         try:
+            proxies = _requests_proxies()
             r = requests.post(
                 f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
+                json={"chat_id": TG_CHAT_ID, "text": message},
+                timeout=15,
+                proxies=proxies,
+            )
             print("Telegram:", "成功" if r.status_code == 200 else f"失败 {r.status_code}")
         except Exception as e:
             print("Telegram 异常:", e)
 
 
 # ============================================================
-# ★★★ 新增：精确查找登录按钮
+# 精确查找登录按钮
 # ============================================================
 def find_login_button(sb):
-    """
-    在页面里精确定位登录按钮。返回 (定位符, 元素文本) 或 (None, None)。
-    只考虑表单内的 submit 按钮，或文字明确是"登录/Sign in"的按钮。
-    排除"搜索/订阅"等明显无关按钮。
-    """
     candidates = [
         "//form//button[@type='submit']",
         "//form//button[contains(., '登录')]",
@@ -56,7 +71,6 @@ def find_login_button(sb):
         "//button[contains(., 'Sign In')]",
         "//button[contains(., 'Login')]",
     ]
-    # 明确排除的关键词（防止误点搜索/订阅/注册）
     exclude_keywords = ("搜索", "Search", "订阅", "Subscribe",
                         "注册", "Sign up", "Sign Up", "Register")
     for sel in candidates:
@@ -78,7 +92,6 @@ def find_login_button(sb):
 
 
 def read_award_amount(sb):
-    """读取“每日签到”卡片内的今日奖励金额，并打印所有候选元素用于诊断"""
     debug_info = sb.execute_script("""
         (function() {
             const results = [];
@@ -140,20 +153,15 @@ def read_award_amount(sb):
 
 
 def find_checkin_button(sb):
-    """
-    在页面中查找签到按钮。
-    返回 dict: {"state": "ready"/"already"/"not_found", "text": ..., "diag": ...}
-    关键：在多个包含“立即签到”的元素中，选文本最短的（最内层），优先 button 标签。
-    """
     raw = sb.execute_script("""
         (function() {
             const allElems = document.querySelectorAll('button, a, div, span');
-            let bestImmediate = null;   // {el, text, isButton}
+            let bestImmediate = null;
             let bestDone = null;
 
             for (let e of allElems) {
                 const t = (e.textContent || '').trim();
-                if (t.length > 60) continue;      // 跳过超长容器
+                if (t.length > 60) continue;
 
                 const isBtn = (e.tagName === 'BUTTON');
 
@@ -240,15 +248,29 @@ def browser_checkin():
     }
 
     print("🚀 启动浏览器（UC 模式）…")
-    with SB(
+
+    # ★★★ Xvfb + headed：在无显示器的 CI 上跑"有头"浏览器
+    sb_kwargs = dict(
         uc=True,
         headed=True,
-        xvfb=False,
+        xvfb=True,          # ★ 打开虚拟显示
         incognito=True,
         locale_code="zh-CN",
         window_size="1920,1080",
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
-    ) as sb:
+    )
+    if CHROME_PROXY:
+        print(f"🌐 浏览器代理: {CHROME_PROXY}")
+        sb_kwargs["proxy"] = CHROME_PROXY
+    else:
+        print("🌐 浏览器代理: 未启用（直连）")
+
+    if HTTPS_PROXY:
+        print(f"🌐 requests 代理: {HTTPS_PROXY}")
+    else:
+        print("🌐 requests 代理: 未启用（直连）")
+
+    with SB(**sb_kwargs) as sb:
         try:
             # ---------- 打开登录页 ----------
             print(f"🌐 打开登录页: {LOGIN_URL}")
@@ -275,13 +297,60 @@ def browser_checkin():
             except Exception as e:
                 print(f"⚠️ 勾选异常: {e}")
 
-            # ---------- 保存登录页源码（诊断用） ----------
+            # ---------- 保存登录页源码 ----------
             try:
                 with open("login_page_source.html", "w", encoding="utf-8") as f:
                     f.write(sb.get_page_source())
                 print("  📄 已保存登录页源码到 login_page_source.html")
             except Exception as e:
                 print(f"  保存登录页源码失败: {e}")
+
+            # ---------- Turnstile 结构诊断 ----------
+            print("🔬 诊断 Turnstile 结构…")
+            try:
+                diag = sb.execute_script("""
+                    (function() {
+                        const r = { iframes: [], inputs: [], widgets: [] };
+                        document.querySelectorAll('iframe').forEach(function(f) {
+                            r.iframes.push({
+                                src: (f.src || '').slice(0, 120),
+                                visible: !!(f.offsetWidth || f.offsetHeight),
+                                w: f.offsetWidth, h: f.offsetHeight
+                            });
+                        });
+                        document.querySelectorAll('input, textarea').forEach(function(i) {
+                            const n = (i.name || '').toLowerCase();
+                            if (n.indexOf('turnstile') >= 0 || n.indexOf('captcha') >= 0 || n.indexOf('token') >= 0) {
+                                r.inputs.push({
+                                    name: i.name,
+                                    type: i.type,
+                                    value_len: (i.value || '').length,
+                                    hidden: i.type === 'hidden'
+                                });
+                            }
+                        });
+                        document.querySelectorAll('.cf-turnstile, [data-sitekey]').forEach(function(e) {
+                            r.widgets.push({
+                                tag: e.tagName,
+                                cls: (e.className || '').slice(0, 80),
+                                sitekey: (e.getAttribute('data-sitekey') || '').slice(0, 20),
+                                responseField: e.getAttribute('data-response-field-name') || '',
+                                visible: !!(e.offsetWidth || e.offsetHeight)
+                            });
+                        });
+                        return JSON.stringify(r);
+                    })()
+                """)
+                print("  Turnstile 诊断 JSON:")
+                print("  " + diag)
+            except Exception as e:
+                print(f"  诊断异常: {e}")
+
+            try:
+                sb.save_screenshot("turnstile_before.png")
+                print("  📸 turnstile_before.png")
+            except Exception:
+                pass
 
             # ---------- Turnstile ----------
             print("⏳ 等待登录 Turnstile…")
@@ -291,16 +360,40 @@ def browser_checkin():
             except Exception as e:
                 print(f"  click_captcha 异常: {e}")
 
-            # ★★★ 硬检查：60s 内没拿到 token 就放弃
             turnstile_ok = False
             for i in range(60):
-                tk = sb.execute_script(
-                    'return (document.querySelector(\'[name="cf-turnstile-response"]\') || {}).value || "";'
-                )
+                tk = sb.execute_script(r"""
+                    (function() {
+                        const names = [
+                            'cf-turnstile-response',
+                            'cf_turnstile_response',
+                            'turnstile_token',
+                            'g-recaptcha-response',
+                        ];
+                        for (const n of names) {
+                            const el = document.querySelector(`[name="${n}"]`);
+                            if (el && el.value && el.value.length > 20) {
+                                return n + '|' + el.value;
+                            }
+                        }
+                        const all = document.querySelectorAll('input[type="hidden"], textarea');
+                        for (const el of all) {
+                            const n = (el.name || '').toLowerCase();
+                            if ((n.includes('token') || n.includes('captcha') || n.includes('turnstile'))
+                                && el.value && el.value.length > 20) {
+                                return el.name + '|' + el.value;
+                            }
+                        }
+                        return '';
+                    })()
+                """)
                 if tk:
-                    print(f"✅ 登录 Turnstile token 长度: {len(tk)}")
+                    field_name, _, val = tk.partition('|')
+                    print(f"✅ Turnstile token: 字段名={field_name} 长度={len(val)}")
                     turnstile_ok = True
                     break
+                if i % 10 == 9:
+                    print(f"  ⏳ 等待 Turnstile token… {i+1}s")
                 sb.sleep(1)
 
             if not turnstile_ok:
@@ -366,12 +459,10 @@ def browser_checkin():
             for i in range(30):
                 sb.sleep(2)
                 cur = sb.get_current_url()
-                # 必须回到 hcnsec 域名，且不含 sign-in/login
                 if "hcnsec" in cur and LOGIN_PATH not in cur and "/login" not in cur:
                     logged_in = True
                     print(f"✅ 登录成功: {cur}")
                     break
-                # 跳到其他域名 → 立即中止
                 if "hcnsec" not in cur:
                     print(f"❌ 登录过程中跳到异常域名: {cur}")
                     try:
@@ -413,7 +504,7 @@ def browser_checkin():
             state = info.get("state", "not_found")
             result["button_before"] = info.get("text", "")
 
-            # ---------- 已签到 → 读金额 ----------
+            # ---------- 已签到 ----------
             if state == "already":
                 print(f"✅ 今日已签到 | 按钮: '{info.get('text')}'")
                 result["already_done"] = True
@@ -532,6 +623,16 @@ def main():
     if not EMAIL or not PASSWORD:
         print("❌ 请设置 EMAIL 和 PASSWORD 环境变量")
         sys.exit(1)
+
+    print("=" * 50)
+    print("⚙️  配置检查")
+    print("=" * 50)
+    print(f"   EMAIL         : {'✅ 已设置' if EMAIL else '❌ 空'}")
+    print(f"   PASSWORD      : {'✅ 已设置' if PASSWORD else '❌ 空'}")
+    print(f"   TG 通知       : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用'}")
+    print(f"   CHROME_PROXY  : {CHROME_PROXY or '⚪ 未设置（直连）'}")
+    print(f"   HTTPS_PROXY   : {HTTPS_PROXY or '⚪ 未设置（直连）'}")
+    print("=" * 50)
 
     now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
     r = browser_checkin()
