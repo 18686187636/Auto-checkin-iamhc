@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v15-hcnsec: 屏蔽 Turnstile 走降级路径 + 抓登录请求看服务端反应
+# v16-hcnsec: 屏蔽广告但放行 Turnstile + uc_gui_click_captcha
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -57,178 +57,29 @@ def check_url(sb, expected_contains="hcnsec", tag=""):
     return True, cur
 
 
-# ★★★ 页面加载后注入的 hook（时机：React 已渲染）
-INJECT_HOOK_JS = r"""
-(function() {
-    if (window.__cap) return 'ALREADY';
-
-    window.__cap = { requests: [], console: [], errors: [] };
-
-    // ---- fetch ----
-    try {
-        var _origFetch = window.fetch;
-        window.fetch = function() {
-            var args = arguments;
-            var url = String(args[0]).slice(0, 300);
-            var opts = args[1] || {};
-            var method = (opts.method || 'GET').toUpperCase();
-            var body = opts.body ? String(opts.body).slice(0, 1000) : '';
-            var t0 = Date.now();
-            window.__cap.requests.push({
-                type: 'REQ', ts: t0, url: url, method: method, body: body, api: 'fetch'
-            });
-            return _origFetch.apply(this, args).then(function(resp) {
-                var entry = {
-                    type: 'RESP', ts: Date.now(),
-                    url: url, status: resp.status, ok: resp.ok,
-                    duration: Date.now() - t0, api: 'fetch'
-                };
-                window.__cap.requests.push(entry);
-                try {
-                    resp.clone().text().then(function(txt) {
-                        window.__cap.requests.push({
-                            type: 'BODY', ts: Date.now(),
-                            url: url, body: txt.slice(0, 2000)
-                        });
-                    }).catch(function(){});
-                } catch(e) {}
-                return resp;
-            }).catch(function(err) {
-                window.__cap.requests.push({
-                    type: 'ERR', ts: Date.now(), url: url,
-                    error: String(err), api: 'fetch'
-                });
-                throw err;
-            });
-        };
-    } catch(e) {}
-
-    // ---- XHR ----
-    try {
-        var _open = XMLHttpRequest.prototype.open;
-        var _send = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function(method, url) {
-            this.__cap_url = String(url).slice(0, 300);
-            this.__cap_method = method;
-            return _open.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function(body) {
-            var self = this;
-            var url = self.__cap_url;
-            var method = self.__cap_method;
-            var bodyStr = body ? String(body).slice(0, 1000) : '';
-            var t0 = Date.now();
-            window.__cap.requests.push({
-                type: 'REQ', ts: t0, url: url, method: method,
-                body: bodyStr, api: 'xhr'
-            });
-            self.addEventListener('load', function() {
-                window.__cap.requests.push({
-                    type: 'RESP', ts: Date.now(), url: url,
-                    status: self.status, duration: Date.now() - t0, api: 'xhr'
-                });
-                try {
-                    window.__cap.requests.push({
-                        type: 'BODY', ts: Date.now(),
-                        url: url, body: (self.responseText || '').slice(0, 2000)
-                    });
-                } catch(e) {}
-            });
-            self.addEventListener('error', function() {
-                window.__cap.requests.push({
-                    type: 'ERR', ts: Date.now(), url: url, api: 'xhr'
-                });
-            });
-            return _send.apply(this, arguments);
-        };
-    } catch(e) {}
-
-    // ---- console ----
-    try {
-        ['log','warn','error','info','debug'].forEach(function(lvl) {
-            var orig = console[lvl];
-            console[lvl] = function() {
-                var s = [];
-                for (var i = 0; i < arguments.length; i++) {
-                    var a = arguments[i];
-                    try { s.push(typeof a === 'string' ? a : JSON.stringify(a)); }
-                    catch(e) { s.push(String(a)); }
-                }
-                window.__cap.console.push({
-                    ts: Date.now(), level: lvl,
-                    text: s.join(' ').slice(0, 500)
-                });
-                return orig.apply(this, arguments);
-            };
-        });
-    } catch(e) {}
-
-    // ---- error ----
-    window.addEventListener('error', function(e) {
-        try {
-            window.__cap.errors.push({
-                ts: Date.now(),
-                msg: String(e.message || '').slice(0, 300),
-                src: String(e.filename || '').slice(0, 200),
-                line: e.lineno || 0
-            });
-        } catch(_) {}
-    });
-    window.addEventListener('unhandledrejection', function(e) {
-        try {
-            window.__cap.errors.push({
-                ts: Date.now(),
-                msg: 'REJECT: ' + String(e.reason).slice(0, 300)
-            });
-        } catch(_) {}
-    });
-
-    return 'OK';
-})();
-"""
-
-
-def dump_captured(sb, label=""):
-    print(f"\n{'='*60}")
-    print(f"📊 捕获数据 {label}")
-    print(f"{'='*60}")
-
+def get_turnstile_state(sb):
+    """返回 dict: {turnstile_api, cf_widget, data_sitekey, token_len, iframe_count, iframe_src}"""
     try:
-        cap = sb.execute_script("return window.__cap ? JSON.stringify(window.__cap) : '{}';")
-        data = json.loads(cap) if cap else {}
+        raw = sb.execute_script("""
+            var ifr = document.querySelectorAll('iframe');
+            var ifr_srcs = [];
+            for (var i=0; i<ifr.length; i++) {
+                ifr_srcs.push((ifr[i].src || '').slice(0, 150));
+            }
+            var tk = document.querySelector('[name="cf-turnstile-response"]');
+            return JSON.stringify({
+                turnstile_api: typeof window.turnstile,
+                render: window.turnstile ? typeof window.turnstile.render : 'N/A',
+                cf_widget: document.querySelectorAll('.cf-turnstile').length,
+                data_sitekey: document.querySelectorAll('[data-sitekey]').length,
+                token_len: tk ? (tk.value || '').length : -1,
+                iframe_count: ifr.length,
+                iframe_srcs: ifr_srcs
+            });
+        """)
+        return json.loads(raw) if raw else {}
     except Exception as e:
-        print(f"  读取失败: {e}")
-        return
-
-    reqs = data.get("requests", [])
-    print(f"\n🌐 网络请求（{len(reqs)} 条）:")
-    for r in reqs:
-        t = r.get("type", "?")
-        url = r.get("url", "")[:180]
-        if t == "REQ":
-            print(f"  ➡️  [{r.get('api','?')}] {r.get('method','?')} {url}")
-            if r.get("body"):
-                print(f"      BODY: {r['body'][:300]}")
-        elif t == "RESP":
-            print(f"  ⬅️  [{r.get('api','?')}] {r.get('status','?')} {url} ({r.get('duration','?')}ms)")
-        elif t == "BODY":
-            print(f"  📄  BODY {url}")
-            print(f"      {r.get('body','')[:500]}")
-        elif t == "ERR":
-            print(f"  ❌  {url} {r.get('error','')}")
-
-    con = data.get("console", [])
-    print(f"\n💬 Console（{len(con)} 条）:")
-    for c in con[-30:]:
-        lvl = c.get("level", "?")
-        txt = c.get("text", "")[:200]
-        mark = "❌" if lvl == "error" else ("⚠️" if lvl == "warn" else "  ")
-        print(f"  {mark} [{lvl}] {txt}")
-
-    errs = data.get("errors", [])
-    print(f"\n⚠️  未捕获错误（{len(errs)} 条）:")
-    for e in errs:
-        print(f"  ❌ {e.get('msg','')} @ {e.get('src','')}:{e.get('line','')}")
+        return {"error": str(e)}
 
 
 def list_all_buttons(sb):
@@ -404,25 +255,19 @@ def browser_checkin():
 
             print(f"  当前 URL: {sb.get_current_url()}")
 
-            # 检查 turnstile 是否被屏蔽
-            print("\n🔬 检查 Turnstile 是否被屏蔽:")
-            try:
-                ts = sb.execute_script("""
-                    return 'turnstile=' + typeof window.turnstile +
-                        ' | cf-turnstile=' + document.querySelectorAll('.cf-turnstile').length +
-                        ' | data-sitekey=' + document.querySelectorAll('[data-sitekey]').length;
-                """)
-                print(f"    {ts}")
-            except Exception as e:
-                print(f"    {e}")
+            # 等 Turnstile 初始化
+            print("\n⏳ 等待 Turnstile api.js 初始化…")
+            for i in range(15):
+                st = get_turnstile_state(sb)
+                if st.get("turnstile_api") == "object" and st.get("render") == "function":
+                    print(f"  ✅ Turnstile API 就绪 (等待 {i}s)")
+                    break
+                sb.sleep(1)
+            else:
+                print("  ⚠️ Turnstile api.js 未就绪")
 
-            # ★ 注入 hook（页面已加载完，但点击登录的请求还没发出）
-            print("\n📡 注入请求/console 拦截器…")
-            try:
-                ok_inject = sb.execute_script(INJECT_HOOK_JS)
-                print(f"   {ok_inject}")
-            except Exception as e:
-                print(f"   注入失败: {e}")
+            st = get_turnstile_state(sb)
+            print(f"  初始状态: {json.dumps(st, ensure_ascii=False)}")
 
             # 填表
             print("\n✍️ 填写表单…")
@@ -466,16 +311,78 @@ def browser_checkin():
             if login_sel:
                 print(f"  ✅ 按钮可用: '{login_text}'")
             else:
-                print("  ⚠️ 按钮不可用，列出所有按钮:")
+                print("  ⚠️ 按钮 disabled（Turnstile token 未就绪？）")
                 for j, b in enumerate(list_all_buttons(sb)):
                     print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']}")
 
-            # 点登录前，清空缓冲
-            print("\n🧹 清空捕获缓冲，准备点击登录…")
-            sb.execute_script("if (window.__cap) { window.__cap.requests = []; window.__cap.console = []; window.__cap.errors = []; }")
+            # 检查 iframe（Turnstile widget 是否渲染）
+            st = get_turnstile_state(sb)
+            print(f"\n🔍 Turnstile 状态: {json.dumps(st, ensure_ascii=False)}")
 
-            # 点击登录
-            print("🖱️ 点击登录按钮…")
+            # ★★★ 核心：uc_gui_click_captcha 点 Turnstile
+            #    v11 之前之所以触发雅虎跳转，是因为 s0-greate 的覆盖层
+            #    现在 s0-greate 被 sing-box 屏蔽，覆盖层不存在，安全了
+            print("\n🎯 尝试 uc_gui_click_captcha 点击 Turnstile…")
+            for attempt in range(5):
+                try:
+                    sb.uc_gui_click_captcha()
+                    print(f"  第 {attempt+1} 次点击 (uc_gui_click_captcha)")
+                except Exception as e:
+                    print(f"  第 {attempt+1} 次异常: {e}")
+                sb.sleep(3)
+
+                # 每次点击后检查 URL 和状态
+                ok, cur = check_url(sb, "hcnsec", tag=f"after_captcha_click_{attempt+1}")
+                if not ok:
+                    result["error"] = f"点击 Turnstile 后被劫持: {cur[:80]}"
+                    return result
+
+                st = get_turnstile_state(sb)
+                token_len = st.get("token_len", 0)
+                if token_len and token_len > 20:
+                    print(f"  ✅ Token 出现！长度={token_len}")
+                    break
+                if st.get("iframe_count", 0) > 0:
+                    print(f"  有 {st['iframe_count']} 个 iframe，srcs={st.get('iframe_srcs')}")
+
+            # 等 token
+            print("\n⏳ 等待 Turnstile token（最多 60s）…")
+            token_ok = False
+            for i in range(60):
+                sb.sleep(1)
+                st = get_turnstile_state(sb)
+                if st.get("token_len", 0) > 20:
+                    print(f"  ✅ Token 已就绪！长度={st['token_len']}")
+                    token_ok = True
+                    break
+                if i % 10 == 9:
+                    print(f"  ⏳ {i+1}s: token_len={st.get('token_len')}, iframe={st.get('iframe_count')}")
+                    try:
+                        sb.uc_gui_click_captcha()
+                    except Exception:
+                        pass
+
+            if not token_ok:
+                print("❌ Token 未出现")
+                try:
+                    sb.save_screenshot("token_timeout.png")
+                except Exception:
+                    pass
+                result["error"] = "Turnstile token 未出现"
+                return result
+
+            # 检查按钮
+            print("\n🔍 检查按钮状态…")
+            login_sel, login_text = find_login_button(sb)
+            if login_sel:
+                print(f"  ✅ 按钮可用: '{login_text}'")
+            else:
+                print("  ⚠️ 按钮仍 disabled，强点")
+                for j, b in enumerate(list_all_buttons(sb)):
+                    print(f"    [{j}] {b['tag']} '{b['text']}' disabled={b['disabled']}")
+
+            # 点登录
+            print("\n🖱️ 点击登录按钮…")
             sb.execute_script("""
                 var btn = document.querySelector("button[type='submit']");
                 if (btn) {
@@ -487,13 +394,13 @@ def browser_checkin():
                     btn.click();
                 }
             """)
-            sb.sleep(10)
+            sb.sleep(3)
 
-            # ★ Dump
-            dump_captured(sb, "（点击登录后）")
-
-            # 检查 URL
             ok, cur = check_url(sb, "hcnsec", tag="after_login_click")
+            if not ok:
+                result["error"] = f"登录后跳到异常域名: {cur[:80]}"
+                return result
+
             print(f"  点击后 URL: {cur}")
 
             # 等跳转
@@ -520,7 +427,6 @@ def browser_checkin():
                         f.write(sb.get_page_source())
                 except Exception:
                     pass
-                dump_captured(sb, "（登录失败时）")
                 result["error"] = "登录失败"
                 return result
 
