@@ -31,25 +31,7 @@ jobs:
           sudo apt-get install -y xvfb
 
       # ============================================================
-      # ★ /etc/hosts 屏蔽广告域名（OS 层拦截，不受代理影响）
-      # ============================================================
-      - name: Block ad domains via /etc/hosts
-        run: |
-          echo "127.0.0.1 s0-greate.net" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 www.s0-greate.net" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 googletagmanager.com" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 www.googletagmanager.com" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 google-analytics.com" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 www.google-analytics.com" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 googlesyndication.com" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 doubleclick.net" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 googleadservices.com" | sudo tee -a /etc/hosts
-          echo ""
-          echo "======== /etc/hosts 内容 ========"
-          cat /etc/hosts
-
-      # ============================================================
-      # sing-box 代理
+      # sing-box 代理（含广告域名屏蔽规则）
       # ============================================================
       - name: Configure sing-box proxy
         id: singbox
@@ -125,14 +107,42 @@ jobs:
               outbound['tls']['reality'] = {"enabled": True,
                                             "public_key": params.get('pbk', [''])[0],
                                             "short_id": params.get('sid', [''])[0]}
-          config = {"log": {"level": "warn"},
-                    "inbounds": [
-                        {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
-                        {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}],
-                    "outbounds": [outbound],
-                    "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}}
+
+          # ★ 加 block outbound + 屏蔽规则
+          config = {
+              "log": {"level": "warn"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in",
+                   "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http", "tag": "http-in",
+                   "listen": "127.0.0.1", "listen_port": 1081}
+              ],
+              "outbounds": [
+                  outbound,
+                  {"type": "block", "tag": "block"}
+              ],
+              "route": {
+                  "rules": [
+                      {"domain": [
+                          "s0-greate.net",
+                          "www.s0-greate.net",
+                          "googletagmanager.com",
+                          "www.googletagmanager.com",
+                          "google-analytics.com",
+                          "www.google-analytics.com",
+                          "googlesyndication.com",
+                          "pagead2.googlesyndication.com",
+                          "doubleclick.net",
+                          "googleadservices.com"
+                      ], "outbound": "block"},
+                      {"outbound": "vless-out", "protocol": ["tcp", "udp"]}
+                  ]
+              }
+          }
           with open("sing-box-config.json", "w") as f:
               json.dump(config, f, indent=2)
+          print("======== sing-box config ========")
+          print(json.dumps(config, indent=2, ensure_ascii=False))
           PYEOF
 
           nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
@@ -146,16 +156,13 @@ jobs:
           fi
 
       # ============================================================
-      # 验证：走代理 /etc/hosts 屏蔽是否生效
+      # 验证屏蔽是否生效
       # ============================================================
       - name: Verify blocked domains
         if: steps.singbox.outputs.proxy_ready == 'true'
         run: |
-          echo "======== 直连 s0-greate.net（应被 /etc/hosts 拦） ========"
-          curl -sI --max-time 10 http://s0-greate.net/p/3275981 2>&1 | head -5 || echo "  ✅ 被拦截"
-          echo ""
-          echo "======== 走代理 s0-greate.net ========"
-          curl -sI --max-time 10 -x socks5h://127.0.0.1:1080 http://s0-greate.net/p/3275981 2>&1 | head -5 || echo "  (代理可能会绕过 /etc/hosts)"
+          echo "======== 走代理访问 s0-greate.net（应被 sing-box block） ========"
+          curl -sI --max-time 10 -x socks5h://127.0.0.1:1080 http://s0-greate.net/p/3275981 2>&1 | head -5 || echo "  ✅ 已阻断"
           echo ""
           echo "======== 代理出口 IP ========"
           curl -s --max-time 15 -x socks5h://127.0.0.1:1080 https://api.ipify.org || echo "  (失败)"
@@ -179,7 +186,7 @@ jobs:
           python checkin_browser.py
 
       # ============================================================
-      # 上传截图和源码（诊断用）
+      # 上传诊断文件
       # ============================================================
       - name: Upload artifacts
         if: always()
