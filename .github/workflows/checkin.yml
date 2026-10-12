@@ -102,7 +102,7 @@ jobs:
                                             "public_key": params.get('pbk', [''])[0],
                                             "short_id": params.get('sid', [''])[0]}
 
-          # ★★★ 关键：block Cloudflare Turnstile 域名
+          # ★★★ 关键：只屏蔽 s0-greate 广告，放行 Turnstile
           config = {
               "log": {"level": "warn"},
               "inbounds": [
@@ -117,9 +117,8 @@ jobs:
               ],
               "route": {
                   "rules": [
-                      # ★ 屏蔽 Cloudflare Turnstile + 常见广告域
+                      # ★ 只屏蔽广告/追踪，放行 challenges.cloudflare.com
                       {"domain": [
-                          "challenges.cloudflare.com",
                           "s0-greate.net",
                           "www.s0-greate.net",
                           "googletagmanager.com",
@@ -136,8 +135,6 @@ jobs:
           }
           with open("sing-box-config.json", "w") as f:
               json.dump(config, f, indent=2)
-          print("======== sing-box config ========")
-          print(json.dumps(config, indent=2, ensure_ascii=False))
           PYEOF
 
           nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
@@ -156,8 +153,11 @@ jobs:
           echo "======== 代理出口 IP ========"
           curl -s --max-time 15 -x socks5h://127.0.0.1:1080 https://api.ipify.org || echo "  (失败)"
           echo ""
-          echo "======== 验证 turnstile 被屏蔽 ========"
-          curl -sI --max-time 10 -x socks5h://127.0.0.1:1080 https://challenges.cloudflare.com/turnstile/v0/api.js 2>&1 | head -3 || echo "  ✅ 已阻断"
+          echo "======== s0-greate.net 应被阻断 ========"
+          curl -sI --max-time 10 -x socks5h://127.0.0.1:1080 https://s0-greate.net/p/3275981 2>&1 | head -3 || echo "  ✅ 已阻断"
+          echo ""
+          echo "======== Turnstile api.js 应可访问 ========"
+          curl -sI --max-time 15 -x socks5h://127.0.0.1:1080 https://challenges.cloudflare.com/turnstile/v0/api.js 2>&1 | head -3
 
       - name: Run checkin
         if: steps.singbox.outputs.proxy_ready == 'true'
