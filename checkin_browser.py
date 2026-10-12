@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v12-hcnsec: /etc/hosts 屏蔽 + 深度搜 sitekey + React 原生 fill
+# v12-hcnsec: sing-box 层屏蔽 + 深度搜 sitekey + React 原生 fill
 
 import os, sys, time, json, re, requests
 from datetime import datetime, timezone, timedelta
@@ -291,7 +291,7 @@ def browser_checkin():
 
             print(f"  当前 URL: {sb.get_current_url()}")
 
-            # ---------- ★ 关键诊断 1: s0-greate.net 是否加载 ----------
+            # ---------- 诊断 1: s0-greate.net 是否加载 ----------
             print("\n🔬 诊断 1: 检查 s0-greate.net 网络请求")
             try:
                 reqs = sb.execute_script("""
@@ -304,11 +304,11 @@ def browser_checkin():
                 if reqs:
                     print(f"  ⚠️ s0-greate.net 仍加载:\n    {reqs}")
                 else:
-                    print(f"  ✅ s0-greate.net 未加载（/etc/hosts 屏蔽生效）")
+                    print(f"  ✅ s0-greate.net 未加载（sing-box block 生效）")
             except Exception as e:
                 print(f"  诊断异常: {e}")
 
-            # ---------- ★ 关键诊断 2: 搜 sitekey ----------
+            # ---------- 诊断 2: 搜 sitekey ----------
             print("\n🔬 诊断 2: 深度搜索 sitekey")
             sk = search_sitekey(sb)
             if sk:
@@ -317,7 +317,7 @@ def browser_checkin():
             else:
                 print("    ⚠️ 未找到任何 sitekey")
 
-            # ---------- ★ 关键诊断 3: Turnstile 环境 ----------
+            # ---------- 诊断 3: Turnstile 环境 ----------
             print("\n🔬 诊断 3: Turnstile 环境")
             try:
                 ts = sb.execute_script("""
@@ -333,23 +333,10 @@ def browser_checkin():
             except Exception as e:
                 print(f"    诊断异常: {e}")
 
-            # ---------- 输入凭证（用 JS 原生 fill 触发 React 事件）----------
+            # ---------- 输入凭证（React 原生 fill）----------
             print("\n✍️ 用 React 原生方式填写表单…")
 
             def react_fill(name, value):
-                sb.execute_script("""
-                    var el = document.querySelector(`input[name="${arguments[0]}"]`);
-                    if (!el) return false;
-                    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(el, arguments[1]);
-                    el.dispatchEvent(new Event('input', {bubbles: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    el.dispatchEvent(new Event('blur', {bubbles: true}));
-                    return true;
-                """, [name, value])
-
-            # ★ 注意：execute_script 不支持多参数，改用单参数对象
-            def react_fill2(name, value):
                 payload = json.dumps({"name": name, "value": value})
                 return sb.execute_script("""
                     var p = JSON.parse(arguments[0]);
@@ -363,10 +350,10 @@ def browser_checkin():
                     return true;
                 """, payload)
 
-            ok = react_fill2("username", EMAIL)
+            ok = react_fill("username", EMAIL)
             print(f"  username fill: {ok}")
             sb.sleep(0.5)
-            ok = react_fill2("password", PASSWORD)
+            ok = react_fill("password", PASSWORD)
             print(f"  password fill: {ok}")
             sb.sleep(0.5)
 
@@ -375,7 +362,7 @@ def browser_checkin():
                 result["error"] = f"填表后被劫持: {cur[:80]}"
                 return result
 
-            # ---------- 勾选同意（JS click）----------
+            # ---------- 勾选同意 ----------
             print("☑️ 勾选法律同意…")
             consent_sel = "span[role='checkbox'][aria-labelledby='legal-consent-label']"
             try:
@@ -403,7 +390,7 @@ def browser_checkin():
             """)
             print(f"    {btn_info}")
 
-            # 等等看按钮是否变 enabled
+            # 等待按钮 enabled
             print("⏳ 等待按钮 enabled（最多 30s）…")
             login_sel, login_text = None, None
             for i in range(30):
@@ -421,7 +408,6 @@ def browser_checkin():
                 print("❌ 30s 后按钮仍 disabled")
                 sb.save_screenshot("button_still_disabled.png")
 
-                # 保存关键调试信息
                 try:
                     with open("login_page_source.html", "w", encoding="utf-8") as f:
                         f.write(sb.get_page_source())
