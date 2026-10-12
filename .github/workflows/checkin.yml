@@ -2,7 +2,6 @@ name: iamhc 签到
 
 on:
   schedule:
-    # UTC 22:00 = 北京时间 06:00
     - cron: "0 22 * * *"
   workflow_dispatch:
 
@@ -30,9 +29,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb
 
-      # ============================================================
-      # sing-box 代理（含广告域名屏蔽规则）
-      # ============================================================
       - name: Configure sing-box proxy
         id: singbox
         env:
@@ -107,42 +103,14 @@ jobs:
               outbound['tls']['reality'] = {"enabled": True,
                                             "public_key": params.get('pbk', [''])[0],
                                             "short_id": params.get('sid', [''])[0]}
-
-          # ★ 加 block outbound + 屏蔽规则
-          config = {
-              "log": {"level": "warn"},
-              "inbounds": [
-                  {"type": "socks", "tag": "socks-in",
-                   "listen": "127.0.0.1", "listen_port": 1080},
-                  {"type": "http", "tag": "http-in",
-                   "listen": "127.0.0.1", "listen_port": 1081}
-              ],
-              "outbounds": [
-                  outbound,
-                  {"type": "block", "tag": "block"}
-              ],
-              "route": {
-                  "rules": [
-                      {"domain": [
-                          "s0-greate.net",
-                          "www.s0-greate.net",
-                          "googletagmanager.com",
-                          "www.googletagmanager.com",
-                          "google-analytics.com",
-                          "www.google-analytics.com",
-                          "googlesyndication.com",
-                          "pagead2.googlesyndication.com",
-                          "doubleclick.net",
-                          "googleadservices.com"
-                      ], "outbound": "block"},
-                      {"outbound": "vless-out", "protocol": ["tcp", "udp"]}
-                  ]
-              }
-          }
+          config = {"log": {"level": "warn"},
+                    "inbounds": [
+                        {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                        {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}],
+                    "outbounds": [outbound],
+                    "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}}
           with open("sing-box-config.json", "w") as f:
               json.dump(config, f, indent=2)
-          print("======== sing-box config ========")
-          print(json.dumps(config, indent=2, ensure_ascii=False))
           PYEOF
 
           nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
@@ -155,24 +123,12 @@ jobs:
             echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # ============================================================
-      # 验证屏蔽是否生效
-      # ============================================================
-      - name: Verify blocked domains
+      - name: Verify proxy
         if: steps.singbox.outputs.proxy_ready == 'true'
         run: |
-          echo "======== 走代理访问 s0-greate.net（应被 sing-box block） ========"
-          curl -sI --max-time 10 -x socks5h://127.0.0.1:1080 http://s0-greate.net/p/3275981 2>&1 | head -5 || echo "  ✅ 已阻断"
-          echo ""
           echo "======== 代理出口 IP ========"
           curl -s --max-time 15 -x socks5h://127.0.0.1:1080 https://api.ipify.org || echo "  (失败)"
-          echo ""
-          echo "======== 直连出口 IP ========"
-          curl -s --max-time 10 https://api.ipify.org || echo "  (失败)"
 
-      # ============================================================
-      # 运行签到脚本
-      # ============================================================
       - name: Run checkin
         if: steps.singbox.outputs.proxy_ready == 'true'
         env:
@@ -185,9 +141,6 @@ jobs:
         run: |
           python checkin_browser.py
 
-      # ============================================================
-      # 上传诊断文件
-      # ============================================================
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
