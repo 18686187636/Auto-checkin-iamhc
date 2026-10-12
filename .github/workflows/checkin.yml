@@ -24,7 +24,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install seleniumbase requests
 
       # ============================================================
       # ★ Xvfb：给 headed Chrome 提供虚拟显示
